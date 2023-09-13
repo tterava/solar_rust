@@ -4,7 +4,10 @@
     Requires the following features: `cargo run --example basic_drawing_d --features "extern-canvas"`
 */
 mod matrix;
+mod vector;
+
 use crate::matrix::Matrix4d;
+use crate::vector::Vector4d;
 
 extern crate native_windows_gui as nwg;
 extern crate native_windows_derive as nwd;
@@ -204,7 +207,7 @@ fn main() {
     println!("{:#?}", matrix3);
 
     use crate::Matrix4d as M;
-    let vec = [1.0, 0.0, 0.0, 1.0];
+    let vec = Vector4d{data: [1.0, 0.0, 0.0, 1.0]};
     let angle = std::f64::consts::PI / 2.0;
     let rotation = Matrix4d::rot_x(angle) * Matrix4d::rot_y(angle);
     let translation = Matrix4d::trans([10.0, 0.0, 0.0]);

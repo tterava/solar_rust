@@ -1,6 +1,9 @@
 // Matrix4d[column][row]
 #![allow(dead_code)]
 
+use crate::vector::Vector4d;
+use std::ops::Mul;
+
 #[derive(Debug, Default)]
 pub struct Matrix4d {
     pub data: [[f64; 4]; 4],
@@ -32,11 +35,11 @@ impl Matrix4d {
         }
     }
 
-    pub fn multiply_vec(&self, vec: &[f64; 4]) -> [f64; 4] {
-        let mut result = [0.0, 0.0, 0.0, 0.0];
+    pub fn multiply_vec(&self, vec: &Vector4d) -> Vector4d {
+        let mut result = Vector4d {data: [0.0, 0.0, 0.0, 0.0]};
 
         for row in 0..4 {
-            result[row] = (0..4).fold(0.0, |acc, i| acc + self.data[i][row] * vec[i]);
+            result.data[row] = (0..4).fold(0.0, |acc, i| acc + self.data[i][row] * vec.data[i]);
         }
 
         result
@@ -96,7 +99,6 @@ impl Matrix4d {
     }
 }
 
-use std::ops::Mul;
 impl Mul<Matrix4d> for Matrix4d {
     type Output = Matrix4d;
 
@@ -105,10 +107,10 @@ impl Mul<Matrix4d> for Matrix4d {
     }
 }
 
-impl Mul<[f64; 4]> for Matrix4d {
-    type Output = [f64; 4];
+impl Mul<Vector4d> for Matrix4d {
+    type Output = Vector4d;
 
-    fn mul(self, vec: [f64; 4]) -> [f64; 4] {
+    fn mul(self, vec: Vector4d) -> Vector4d {
         self.multiply_vec(&vec)
     }
 }
