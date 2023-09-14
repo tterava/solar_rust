@@ -107,10 +107,10 @@ impl Mul<Matrix4d> for Matrix4d {
     }
 }
 
-impl Mul<Vector4d> for Matrix4d {
+impl Mul<&Vector4d> for Matrix4d {
     type Output = Vector4d;
 
-    fn mul(self, vec: Vector4d) -> Vector4d {
+    fn mul(self, vec: &Vector4d) -> Vector4d {
         self.multiply_vec(&vec)
     }
 }

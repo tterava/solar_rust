@@ -1,5 +1,6 @@
+#![allow(dead_code)]
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Vector4d {
     pub data: [f64; 4],
 }

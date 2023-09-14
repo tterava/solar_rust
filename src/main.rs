@@ -5,9 +5,13 @@
 */
 mod matrix;
 mod vector;
+mod camera;
+mod engine;
+mod astronomy;
 
 use crate::matrix::Matrix4d;
 use crate::vector::Vector4d;
+use crate::camera::Camera;
 
 extern crate native_windows_gui as nwg;
 extern crate native_windows_derive as nwd;
@@ -41,12 +45,12 @@ impl Default for PaintData {
 
 #[derive(Default, NwgUi)]
 pub struct DrawingApp {
-    #[nwg_control(size: (300, 300), position: (300, 300), title: "Drawing (that's a duck)", flags: "WINDOW|VISIBLE")]
+    #[nwg_control(size: (960, 540), position: (200, 200), title: "Solar system simulator", flags: "WINDOW|VISIBLE")]
     #[nwg_events( OnWindowClose: [nwg::stop_thread_dispatch()], OnInit: [DrawingApp::setup])]
     window: nwg::Window,
 
     // By default ExternCanvas is a window so we must specify the parent here
-    #[nwg_control(parent: Some(&data.window), position: (10, 10), size: (280, 280))]
+    #[nwg_control(parent: Some(&data.window), position: (0,0), size: (960, 540))]
     #[nwg_events( 
         OnPaint: [DrawingApp::paint(SELF, EVT_DATA)],
         OnMousePress: [DrawingApp::events(SELF, EVT)],
@@ -57,7 +61,8 @@ pub struct DrawingApp {
     clicked: Cell<bool>,
     time: Arc<Mutex<f64>>,
 
-    #[nwg_control(parent: window, interval: Duration::from_millis(1000/170))]
+
+    #[nwg_control(parent: window, interval: Duration::from_millis(1000/60))]
     #[nwg_events( OnTimerTick: [DrawingApp::inv] )]
     animation_timer: nwg::AnimationTimer,
 }
@@ -67,7 +72,7 @@ impl DrawingApp {
         let mut data = self.paint_data.borrow_mut();
 
         unsafe {
-            data.background = CreateSolidBrush(RGB(190, 190, 255));
+            data.background = CreateSolidBrush(RGB(0, 0, 0));
             data.border = CreateSolidBrush(RGB(100, 100, 255));
             data.pen = CreatePen(PS_SOLID as _, 2, RGB(20, 20, 20));
             data.yellow = CreateSolidBrush(RGB(255, 255, 0));
@@ -89,7 +94,6 @@ impl DrawingApp {
         match evt {
             E::OnMousePress(M::MousePressLeftUp) => { self.clicked.set(false); },
             E::OnMousePress(M::MousePressLeftDown) => { self.clicked.set(true); },
-            E::OnTimerTick => { println!("Timer!") },
             _ => { },
         }
 
@@ -101,7 +105,7 @@ impl DrawingApp {
         let x = (time.cos() * 100.0) as i32;
         let y = ((4.0 * time).sin() * 40.0) as i32;
 
-        (x, y * -1)
+        (x, -y)
     }
 
     fn paint(&self, data: &nwg::EventData) {
@@ -152,79 +156,50 @@ impl DrawingApp {
 }
 
 fn main() {
-    // nwg::init().expect("Failed to init Native Windows GUI");
-    // nwg::Font::set_global_family("Segoe UI").expect("Failed to set default font");
+    nwg::init().expect("Failed to init Native Windows GUI");
+    nwg::Font::set_global_family("Segoe UI").expect("Failed to set default font");
 
-    // let mut _app = DrawingApp::build_ui(Default::default()).expect("Failed to build UI");
-    // _app.animation_timer.start();
+    let mut _app = DrawingApp::build_ui(Default::default()).expect("Failed to build UI");
+    _app.animation_timer.start();
         
-    // let time_clone = _app.time.clone();
+    let time_clone = _app.time.clone();
 
-    // let should_exit = Arc::new(Mutex::new(false));
-    // let thread_should_exit = Arc::clone(&should_exit);
+    let should_exit = Arc::new(Mutex::new(false));
+    let thread_should_exit = Arc::clone(&should_exit);
 
-    // // Create a vector of thread handles
-    // let handle =             
-    //     thread::spawn(move || {
-    //         let ten_millis = time::Duration::from_millis(1000/170);
-    //         loop {
-    //             thread::sleep(ten_millis);
+    // Create a vector of thread handles
+    let handle =             
+        thread::spawn(move || {
+            let ten_millis = time::Duration::from_millis(1000/170);
+            loop {
+                thread::sleep(ten_millis);
 
-    //             {
-    //                 let should_exit = *thread_should_exit.lock().unwrap();
-    //                 if should_exit {
-    //                     println!("Exiting thread");
-    //                     return;
-    //                 }
-    //             }
+                {
+                    let should_exit = *thread_should_exit.lock().unwrap();
+                    if should_exit {
+                        println!("Exiting thread");
+                        return;
+                    }
+                }
 
-    //             let circle = 2.0 * std::f64::consts::PI;
-    //             let mut time = time_clone.lock().unwrap();
-    //             *time += circle / 100.0;
-    //             if *time > circle {
-    //                 *time -= circle;
-    //             }
-    //         }
-    // });
+                let circle = 2.0 * std::f64::consts::PI;
+                let mut time = time_clone.lock().unwrap();
+                *time += circle / 100.0;
+                if *time > circle {
+                    *time -= circle;
+                }
+            }
+    });
         
-    // nwg::dispatch_thread_events();
+    nwg::dispatch_thread_events();
 
-    // {
-    //     let mut exit = should_exit.lock().unwrap();
-    //     *exit = true;
-    // }
+    {
+        let mut exit = should_exit.lock().unwrap();
+        *exit = true;
+    }
 
-    // handle.join().unwrap();
+    handle.join().unwrap();
 
-    let matrix: Matrix4d = Matrix4d {
-        data: [[4.0, 3.2, 1.1, 1.0], [4.0, 3.2, 1.1, 1.0],[4.0, 3.2, 1.1, 1.0],[4.0, 3.2, 1.1, 1.0]]
-    };
-    let matrix2: Matrix4d = Matrix4d {
-        data: [[5.0, 3.2, 4.1, 2.0], [4.0, 3.5, 1.1, 33.0],[4.0, 3.2, 1.7, 1.0],[4.0, 1.2, 1.1, 1.3]]
-    };
-
-    let matrix3 = matrix * matrix2;
-    println!("{:#?}", matrix3);
-
-    use crate::Matrix4d as M;
-    let vec = Vector4d{data: [1.0, 0.0, 0.0, 1.0]};
-    let angle = std::f64::consts::PI / 2.0;
-    let rotation = Matrix4d::rot_x(angle) * Matrix4d::rot_y(angle);
-    let translation = Matrix4d::trans([10.0, 0.0, 0.0]);
-
-    // let rotated = rotation * translation * vec;
-    let rotated = M::trans([0.0, -5.0, 0.0]) * M::rot_y(PI * 3.0 / 2.0) * M::trans([9.0, 0.0, 0.0]);
-    println!("{:?}", rotated);
-
-    // let rotated = Matrix4d::trans([10.0, 0.0, 0.0]).mul(&Matrix4d::rot_x(angle)).mul(&Matrix4d::rot_y(angle)).mul_vec(vec);
-
-    println!("{:?}", rotated * vec);
-
-    let a = 10;
-    let b = a + 18;
-
-    println!("{}", a);
     
-
 }
 
