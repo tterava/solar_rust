@@ -4,7 +4,7 @@
 use crate::vector::Vector4d;
 use std::ops::Mul;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Matrix4d {
     pub data: [[f64; 4]; 4],
 }
@@ -30,7 +30,7 @@ impl Matrix4d {
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0]
             ],
         }
     }
@@ -54,7 +54,7 @@ impl Matrix4d {
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, a_cos, a_sin, 0.0],
                 [0.0, -a_sin, a_cos, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0]
             ],
         }
     }
@@ -68,7 +68,7 @@ impl Matrix4d {
                 [a_cos, 0.0, -a_sin, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
                 [a_sin, 0.0, a_cos, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0]
             ],
         }
     }
@@ -82,21 +82,34 @@ impl Matrix4d {
                 [a_cos, a_sin, 0.0, 0.0],
                 [-a_sin, a_cos, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0]
             ],
         }
     }
 
-    pub fn trans(pos: [f64; 3]) -> Matrix4d {
+    // We want to move origin to the target, so we translate in reverse direction
+    pub fn trans(pos: &Vector4d) -> Matrix4d {
         Matrix4d {
             data: [
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
-                [pos[0], pos[1], pos[2], 1.0],
-            ],
+                [-pos.data[0], -pos.data[1], -pos.data[2], 1.0]
+           ],
         }
     }
+
+    pub fn scale(factor: f64) -> Matrix4d {
+        Matrix4d {
+            data: [
+                [factor, 0.0, 0.0, 0.0],
+                [0.0, factor, 0.0, 0.0],
+                [0.0, 0.0, factor, 0.0],
+                [0.0, 0.0, 0.0, 1.0]
+           ],
+        }
+    }
+
 }
 
 impl Mul<Matrix4d> for Matrix4d {
@@ -111,6 +124,6 @@ impl Mul<&Vector4d> for Matrix4d {
     type Output = Vector4d;
 
     fn mul(self, vec: &Vector4d) -> Vector4d {
-        self.multiply_vec(&vec)
+        self.multiply_vec(vec)
     }
 }

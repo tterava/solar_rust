@@ -12,3 +12,4 @@ winapi = { version = "0.3", features = [
   "winuser", "wingdi", "winbase", "libloaderapi", "processthreadsapi",
   "errhandlingapi", "winerror", "commctrl", "sysinfoapi", "shobjidl", "combaseapi",
   "commdlg", "d2d1", "objbase", "dwrite", "winnls", "shellapi", "wincodec", "stringapiset"] }
+rand = "0.8.5"

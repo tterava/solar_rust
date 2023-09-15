@@ -8,12 +8,13 @@ pub struct Vector4d {
 impl Vector4d {
     pub fn distance(&self, other: &Vector4d) -> f64 {
         let squared_differece =
-            (0..2).fold(0.0, |acc, i| acc + (self.data[i] - other.data[i]).powi(2));
+            (0..3).fold(0.0, |acc, i| acc + (self.data[i] - other.data[i]).powi(2));
         squared_differece.sqrt()
     }
 
     pub fn length(&self) -> f64 {
-        let squares = (0..2).fold(0.0, |acc, i| acc + self.data[i].powi(2));
+        let squares = (0..3).fold(0.0, |acc, i| acc + self.data[i].powi(2));
+        println!("squares {}", squares);
         squares.sqrt()
     }
 
@@ -54,4 +55,17 @@ impl Vector4d {
         let length = self.length();
         self.multiply(1.0 / length)
     }
+
+    // https://en.wikipedia.org/wiki/Cross_product
+    pub fn cross_product(&self, other: &Vector4d) -> Vector4d {
+        let a = self;
+        let b = other;
+        Vector4d { data: [
+            a.data[1] * b.data[2] - a.data[2] * b.data[1],
+            a.data[0] * b.data[2] - a.data[2] * b.data[0],
+            a.data[0] * b.data[1] - a.data[1] * b.data[0],
+            1.0
+        ] }
+    }
 }
+ 

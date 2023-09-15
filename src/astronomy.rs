@@ -11,6 +11,9 @@
 //                 bodies.Add(new CelestialBody("Monster", 6E30, new Vector3D(90 * AU, 4 * AU, 0), new Vector3D(-11000, 0, 0), 10E5, 50, Brushes.Bisque));
 
 use crate::vector::Vector4d;
+use crate::matrix::Matrix4d;
+
+use rand::Rng;
 
 #[derive(Debug, Clone)]
 pub struct AstronomicalObject {
@@ -25,29 +28,42 @@ pub struct AstronomicalObject {
 
 impl AstronomicalObject {
     pub fn default() -> Vec<AstronomicalObject> {
-        vec![
+        let mut system = vec![
             AstronomicalObject {
                 name: "Sun".to_string(),
-                mass: 1.98855E30,
+                mass: 1.9885E30,
                 position: Vector4d::default(),
                 velocity: Vector4d::default(),
-                radius: 695700.0,
+                radius: 695700.0E3,
                 magnification: 20.0,
                 color: [255, 255, 0],
             },
             AstronomicalObject {
                 name: "Earth".to_string(),
-                mass: 5.97237E24,
+                mass: 5.972168E24,
                 position: Vector4d {
-                    data: [149598023.0, 0.0, 0.0, 1.0],
+                    data: [149598023.0E3, 0.0, 0.0, 1.0],
                 },
                 velocity: Vector4d {
-                    data: [0.0, 29780.0, 0.0, 1.0],
+                    data: [0.0, 29.7827E3, 0.0, 1.0],
                 },
-                radius: 6371.0,
+                radius: 6371.0E3,
                 magnification: 1.0E7,
                 color: [0, 0, 255],
-            },
-        ]
+            }
+        ];
+
+        system.iter_mut().for_each(|x| x.randomize_orbit());
+        system
+
+    }
+
+    fn randomize_orbit(&mut self) {
+        let mut rng = rand::thread_rng();
+        let rotation = rng.gen::<f64>() * std::f64::consts::PI * 2.0;
+        let matrix = Matrix4d::rot_z(rotation);
+
+        self.position = matrix * &self.position;
+        self.velocity = matrix * &self.velocity;
     }
 }

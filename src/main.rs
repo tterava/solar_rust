@@ -9,6 +9,7 @@ mod camera;
 mod engine;
 mod astronomy;
 
+use crate::engine::Engine;
 use crate::matrix::Matrix4d;
 use crate::vector::Vector4d;
 use crate::camera::Camera;
@@ -16,9 +17,11 @@ use crate::camera::Camera;
 extern crate native_windows_gui as nwg;
 extern crate native_windows_derive as nwd;
 
+use astronomy::AstronomicalObject;
 use nwd::NwgUi;
 use nwg::NativeUi;
 use std::f64::consts::PI;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{mem, thread, time};
 use std::cell::{RefCell, Cell};
@@ -26,6 +29,7 @@ use std::sync::{Mutex, Arc};
 use winapi::shared::windef::{HBRUSH, HPEN};
 use winapi::um::wingdi::{CreateSolidBrush, CreatePen, Ellipse, Polygon, SelectObject, RGB, PS_SOLID};
 
+const FRAMERATE: u64 = 60;
 
 pub struct PaintData {
     background: HBRUSH,
@@ -60,9 +64,11 @@ pub struct DrawingApp {
     paint_data: RefCell<PaintData>,
     clicked: Cell<bool>,
     time: Arc<Mutex<f64>>,
+    update_request: Arc<AtomicBool>,
+    bodies: Arc<Mutex<Vec<AstronomicalObject>>>,
+    camera: RefCell<Camera>,
 
-
-    #[nwg_control(parent: window, interval: Duration::from_millis(1000/60))]
+    #[nwg_control(parent: window, interval: Duration::from_millis(1000 / FRAMERATE))]
     #[nwg_events( OnTimerTick: [DrawingApp::inv] )]
     animation_timer: nwg::AnimationTimer,
 }
@@ -80,7 +86,6 @@ impl DrawingApp {
             data.black = CreateSolidBrush(RGB(10, 10, 10));
             data.red = CreateSolidBrush(RGB(255, 10, 0));
         }
-        
     }
 
     fn inv(&self) {
@@ -109,8 +114,6 @@ impl DrawingApp {
     }
 
     fn paint(&self, data: &nwg::EventData) {
-        
-
         use winapi::um::winuser::{FillRect, FrameRect};
         use winapi::shared::windef::POINT as P;
         
@@ -153,6 +156,13 @@ impl DrawingApp {
         paint.end_paint(&ps);
     }
 
+    fn get_paint_objects(&self) {
+        let bodies = self.bodies.lock().unwrap();
+        let camera = self.camera.borrow();
+
+        
+    }
+
 }
 
 fn main() {
@@ -160,46 +170,16 @@ fn main() {
     nwg::Font::set_global_family("Segoe UI").expect("Failed to set default font");
 
     let mut _app = DrawingApp::build_ui(Default::default()).expect("Failed to build UI");
-    _app.animation_timer.start();
-        
-    let time_clone = _app.time.clone();
+    let engine = Engine::init(FRAMERATE);
+    let update_request = _app.update_request.clone();
+    let bodies = _app.bodies.clone();
 
-    let should_exit = Arc::new(Mutex::new(false));
-    let thread_should_exit = Arc::clone(&should_exit);
+    let (update_kill, handle) = engine.get_updater(update_request, bodies);
 
-    // Create a vector of thread handles
-    let handle =             
-        thread::spawn(move || {
-            let ten_millis = time::Duration::from_millis(1000/170);
-            loop {
-                thread::sleep(ten_millis);
-
-                {
-                    let should_exit = *thread_should_exit.lock().unwrap();
-                    if should_exit {
-                        println!("Exiting thread");
-                        return;
-                    }
-                }
-
-                let circle = 2.0 * std::f64::consts::PI;
-                let mut time = time_clone.lock().unwrap();
-                *time += circle / 100.0;
-                if *time > circle {
-                    *time -= circle;
-                }
-            }
-    });
-        
+    _app.animation_timer.start();        
     nwg::dispatch_thread_events();
 
-    {
-        let mut exit = should_exit.lock().unwrap();
-        *exit = true;
-    }
-
+    update_kill.store(true, Ordering::Relaxed);
     handle.join().unwrap();
-
-    
 }
 
