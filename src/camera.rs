@@ -1,5 +1,5 @@
-use crate::vector::Vector4d;
 use crate::matrix::Matrix4d;
+use crate::vector::Vector4d;
 
 // For drawing camera is assumed to be situated on the positive side of the Z-axis at (0,0,1), with target being origin.
 // Matrix operations are used to transform the simulation space into camera space.
@@ -10,7 +10,7 @@ use std::f64::consts::PI;
 pub struct Camera {
     pub pos: Vector4d,
     pub target: Vector4d,
-    pub fov: f64
+    pub fov: f64,
 }
 
 impl Camera {
@@ -22,7 +22,7 @@ impl Camera {
         direction_vec.data[0].atan2(direction_vec.data[2])
     }
 
-    // Pitch is relative to the XZ-plane. 
+    // Pitch is relative to the XZ-plane.
     pub fn get_pitch(&self) -> f64 {
         let direction_vec = self.pos.substract(&self.target);
 
@@ -33,26 +33,40 @@ impl Camera {
 
     pub fn get_full_transformation(&self) -> Matrix4d {
         let translation = Matrix4d::trans(&self.target);
-        
-        let pitch = self.get_pitch();
-        let yaw = self.get_yaw();
 
-        let scale_matrix = Matrix4d::scale(1.0 / self.pos.substract(&self.target).length());
+        let rot_y = Matrix4d::rot_y(-self.get_yaw());
+        let rot_x = Matrix4d::rot_x(self.get_pitch());
 
-        scale_matrix * Matrix4d::rot_x(pitch) * Matrix4d::rot_y(-yaw) * translation
+        let scale_matrix = Matrix4d::scale(1.0 / self.scale());
+
+        scale_matrix * rot_x * rot_y * translation
     }
 
-    pub fn distance(&self) -> f64 {
+    pub fn scale(&self) -> f64 {
         self.pos.substract(&self.target).length()
+    }
+
+    pub fn zoom(&mut self, amount: i32) {
+        let pos = self.pos.substract(&self.target);
+        let new_pos = match amount {
+            0.. => pos.multiply(1.0 / 1.1),
+            _ => pos.multiply(1.1),
+        };
+
+        self.pos = self.target.add(&new_pos);
     }
 }
 
 impl Default for Camera {
     fn default() -> Camera {
         Camera {
-            pos: Vector4d { data: [0.0, 0.0, 1.0, 1.0] },
-            target: Vector4d { data: [0.0, 0.0, 0.0, 1.0] },
-            fov: PI / 180.0 * 75.0  // 75 degrees
+            pos: Vector4d {
+                data: [0.0, -0.5 * 149_597_870_700.0, 2.0 * 149_597_870_700.0, 1.0],
+            },
+            target: Vector4d {
+                data: [0.0, 0.0, 0.0, 1.0],
+            },
+            fov: 75.0,
         }
     }
 }
