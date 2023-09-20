@@ -275,7 +275,6 @@ impl DrawingApp {
         unsafe {
             let brush = CreateSolidBrush(RGB(r, g, b));
             let new_color = Color {r, g, b, brush};
-            println!("Adding brush: {:?}", new_color);
             colors.push(new_color);
             brush
         }        
@@ -289,7 +288,7 @@ fn main() {
     let mut _app = DrawingApp::build_ui(Default::default()).expect("Failed to build UI");
     let engine = Engine::init(FRAMERATE);
 
-    let (engine_handle, kill_request) = engine.start_multithread(_app.bodies.clone());
+    let (engine_handle, kill_request) = engine.start(_app.bodies.clone(), engine::IntegrationMethod::ImplicitEuler);
 
     _app.animation_timer.start();        
     nwg::dispatch_thread_events();

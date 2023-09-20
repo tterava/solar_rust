@@ -4,7 +4,7 @@ use crate::vector::Vector4d;
 // For drawing camera is assumed to be situated on the positive side of the Z-axis at (0,0,1), with target being origin.
 // Matrix operations are used to transform the simulation space into camera space.
 // Camera is always kept in line with Y-axis (Y-axis is directly up). In other words camera only has pitch and yaw.
-use std::f64::consts::PI;
+
 
 #[derive(Debug)]
 pub struct Camera {
