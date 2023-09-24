@@ -1,3 +1,6 @@
+use std::f64::consts::PI;
+
+use crate::astronomy::AU;
 use crate::matrix::Matrix4d;
 use crate::vector::Vector4d;
 
@@ -5,68 +8,72 @@ use crate::vector::Vector4d;
 // Matrix operations are used to transform the simulation space into camera space.
 // Camera is always kept in line with Y-axis (Y-axis is directly up). In other words camera only has pitch and yaw.
 
-
 #[derive(Debug)]
 pub struct Camera {
-    pub pos: Vector4d,
     pub target: Vector4d,
+    pub distance: f64,
+    yaw: f64,
+    pitch: f64,
     pub fov: f64,
 }
 
 impl Camera {
-    pub fn get_yaw(&self) -> f64 {
-        // This gives a vector that points towards the camera as if target was the origin
-        let direction_vec = self.pos.substract(&self.target);
-
-        // Default position of camera lies on positive Z-axis, so we can remap Z -> X and X -> Y
-        direction_vec.data[0].atan2(direction_vec.data[2])
-    }
-
-    // Pitch is relative to the XZ-plane.
     pub fn get_pitch(&self) -> f64 {
-        let direction_vec = self.pos.substract(&self.target);
-
-        // Length of the component that is located on XZ-plane. This is our X for atan2
-        let base_xz = (direction_vec.data[0].powi(2) + direction_vec.data[2].powi(2)).sqrt();
-        direction_vec.data[1].atan2(base_xz)
+        self.pitch
     }
+    pub fn add_pitch(&mut self, angle: f64) {
+        self.set_pitch(self.pitch + angle);
+    }
+    pub fn set_pitch(&mut self, angle: f64) {
+        // Limit pitch between -89.9 degrees and 89.9 degrees or things go upside down.
+        self.pitch = angle.min(PI / 180.0 * 89.9).max(-PI / 180.0 * 89.9);
+    }
+
+    pub fn get_yaw(&self) -> f64 {
+        self.yaw
+    }
+    pub fn add_yaw(&mut self, angle: f64) {
+        self.set_yaw(self.yaw + angle);
+    }
+    pub fn set_yaw(&mut self, angle: f64) {
+        self.yaw = angle % (2.0 * PI);
+    }   
 
     pub fn get_full_transformation(&self) -> Matrix4d {
         let translation = Matrix4d::trans(&self.target);
 
-        let rot_y = Matrix4d::rot_y(-self.get_yaw());
-        let rot_x = Matrix4d::rot_x(self.get_pitch());
+        let rot_y = Matrix4d::rot_y(-self.yaw);
+        let rot_x = Matrix4d::rot_x(-self.pitch);
 
-        let scale_matrix = Matrix4d::scale(1.0 / self.scale());
+        let scale_matrix = Matrix4d::scale(1.0 / self.distance);
 
         scale_matrix * rot_x * rot_y * translation
     }
 
-    pub fn scale(&self) -> f64 {
-        self.pos.substract(&self.target).length()
+    pub fn zoom(&mut self, amount: i32) {
+        match amount {
+            0.. => self.distance /= 1.1,
+            _ => self.distance *= 1.1,
+        };
     }
 
-    pub fn zoom(&mut self, amount: i32) {
-        let pos = self.pos.substract(&self.target);
-        let new_pos = match amount {
-            0.. => pos.multiply(1.0 / 1.1),
-            _ => pos.multiply(1.1),
-        };
+    pub fn get_position(&self) -> Vector4d {
+        let transform = Matrix4d::scale(self.distance) * Matrix4d::rot_y(self.yaw) * Matrix4d::rot_x(self.pitch);
+        let unit_vec = Vector4d { data: [0.0, 0.0, 1.0, 1.0] };
+        let direction_vec = transform * &unit_vec;
 
-        self.pos = self.target.add(&new_pos);
+        self.target.add(&direction_vec)
     }
 }
 
 impl Default for Camera {
     fn default() -> Camera {
         Camera {
-            pos: Vector4d {
-                data: [0.0, -0.5 * 149_597_870_700.0, 2.0 * 149_597_870_700.0, 1.0],
-            },
-            target: Vector4d {
-                data: [0.0, 0.0, 0.0, 1.0],
-            },
-            fov: 75.0,
+            target: Vector4d { data: [0.0, 0.0, 0.0, 1.0] },
+            distance: 2.0 * AU,
+            yaw: 0.0,
+            pitch: 0.0,
+            fov: 75.0
         }
     }
 }

@@ -9,29 +9,26 @@ mod camera;
 mod engine;
 mod astronomy;
 mod input;
+mod integration;
 
 use crate::engine::Engine;
-use crate::matrix::Matrix4d;
 use crate::vector::Vector4d;
 use crate::camera::Camera;
 
 extern crate native_windows_gui as nwg;
 extern crate native_windows_derive as nwd;
 
-use astronomy::AstronomicalObject;
-use input::input_listener;
 use nwd::NwgUi;
 use nwg::NativeUi;
-use std::f64::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use std::{mem, thread, time};
-use std::cell::{RefCell, Cell};
+use std::{mem, thread};
+use std::cell::RefCell;
 use std::sync::{Mutex, Arc};
 use winapi::shared::windef::{HBRUSH, HPEN};
-use winapi::um::wingdi::{CreateSolidBrush, CreatePen, Ellipse, Polygon, SelectObject, RGB, PS_SOLID};
+use winapi::um::wingdi::{CreateSolidBrush, CreatePen, Ellipse, SelectObject, RGB, PS_SOLID};
 
-const FRAMERATE: u64 = 170;
+const FRAMERATE: u32 = 170;
 
 pub struct PaintData {
     background: HBRUSH,
@@ -47,6 +44,13 @@ pub struct Color {
     brush: HBRUSH
 }
 
+struct TargetData {
+    name: String,
+    x: i32,
+    y: i32,
+    radius: i32
+}
+
 impl Default for PaintData {
     fn default() -> Self {
         unsafe { mem::zeroed() }
@@ -56,7 +60,13 @@ impl Default for PaintData {
 #[derive(Default, NwgUi)]
 pub struct DrawingApp {
     #[nwg_control(size: (960, 540), position: (200, 200), title: "Solar system simulator", flags: "WINDOW|VISIBLE|RESIZABLE")]
-    #[nwg_events( OnWindowClose: [nwg::stop_thread_dispatch()], OnInit: [DrawingApp::setup], OnResize: [DrawingApp::update_size], OnWindowMaximize: [DrawingApp::update_size])]
+    #[nwg_events( 
+        OnWindowClose: [nwg::stop_thread_dispatch()], 
+        OnInit: [DrawingApp::setup], 
+        OnResize: [DrawingApp::update_size], 
+        OnWindowMaximize: [DrawingApp::update_size],
+        OnKeyPress: [DrawingApp::events(SELF, EVT, EVT_DATA)]
+    )]
     window: nwg::Window,
 
     // By default ExternCanvas is a window so we must specify the parent here
@@ -64,18 +74,21 @@ pub struct DrawingApp {
     #[nwg_events( 
         OnPaint: [DrawingApp::paint(SELF, EVT_DATA)],
         OnMousePress: [DrawingApp::events(SELF, EVT, EVT_DATA)],
-        OnMouseWheel: [DrawingApp::events(SELF, EVT, EVT_DATA)]
+        OnMouseWheel: [DrawingApp::events(SELF, EVT, EVT_DATA)],
     )]
     canvas: nwg::ExternCanvas,
-
     paint_data: RefCell<PaintData>,
 
-    clicked: Arc<AtomicBool>,
-    bodies: Arc<Mutex<Vec<AstronomicalObject>>>,
-    colors: Arc<Mutex<Vec<Color>>>,
-    camera: Arc<Mutex<Camera>>,
+    engine: Engine,
 
-    #[nwg_control(parent: window, interval: Duration::from_millis(1000 / FRAMERATE))]
+    camera: Arc<Mutex<Camera>>,
+    is_dragging: Arc<AtomicBool>,
+    current_target: Arc<Mutex<String>>,
+    targets: Arc<Mutex<Vec<TargetData>>>,
+    
+    colors: Arc<Mutex<Vec<Color>>>,
+
+    #[nwg_control(parent: window, interval: Duration::from_micros(1_000_000 / FRAMERATE as u64))]
     #[nwg_events( OnTimerTick: [DrawingApp::inv] )]
     animation_timer: nwg::AnimationTimer,
 }
@@ -87,7 +100,7 @@ impl DrawingApp {
         unsafe {
             data.background = CreateSolidBrush(RGB(0, 0, 0));
             data.border = CreateSolidBrush(RGB(100, 100, 255));
-            data.pen = CreatePen(PS_SOLID as _, 2, RGB(20, 20, 20));
+            data.pen = CreatePen(PS_SOLID as _, 1, RGB(35, 35, 35));
         }
     }
 
@@ -99,18 +112,66 @@ impl DrawingApp {
         use nwg::Event as E;
         use nwg::MousePressEvent as M;
         use nwg::EventData::OnMouseWheel as MW;
+        use nwg::EventData::OnKey as K;
 
         match evt {
-            E::OnMousePress(M::MousePressLeftUp) => { self.clicked.store(false, Ordering::Relaxed) },
-            E::OnMousePress(M::MousePressLeftDown) => { 
-                self.clicked.store(true, Ordering::Relaxed);
-                input::input_listener(self.clicked.clone(), self.camera.clone());
+            E::OnMousePress(M::MousePressRightUp) => { self.is_dragging.store(false, Ordering::Relaxed) },
+            E::OnMousePress(M::MousePressRightDown) => { 
+                self.is_dragging.store(true, Ordering::Relaxed);
+                input::input_listener(self.is_dragging.clone(), self.camera.clone());
             },
+            E::OnMousePress(M::MousePressLeftDown) => {
+                let (w_x, w_y) = self.window.position();               
+                let (m_x, m_y) = winput::Mouse::position().unwrap();
+                let (_, size_y) = self.canvas.size();
+
+                let (x, y) = (m_x - w_x - 8, size_y as i32 - (m_y - w_y - 31));  // Offset x: 8, y: 31 works for Windows 11. TODO: Figure a better way for this
+                let targets = self.targets.lock().unwrap();
+
+                println!("{}, {}", m_x - w_x, m_y - w_y);
+                
+                for target in targets.iter().rev() {
+                    let tx = target.x as i64;
+                    let ty = target.y as i64;
+                    let r = target.radius as i64;
+
+                    if (tx - x as i64).pow(2) + (ty - y as i64).pow(2) <= r.pow(2) {
+                        *self.current_target.lock().unwrap() = target.name.clone();
+                        break;
+                    }
+                }
+            }
             E::OnMouseWheel => {
                 if let MW(amount) = evt_data {
                     self.zoom(*amount);
                 }
             },
+            E::OnKeyPress => {
+                if let K(key) = evt_data {
+                    match key {
+                        107 => { *self.engine.target_speed.lock().unwrap() *= 1.2 },
+                        109 => { *self.engine.target_speed.lock().unwrap() /= 1.2 },
+                        32 => { 
+                            if *self.engine.is_running.lock().unwrap() {
+                                self.engine.stop();
+                            } else {
+                                // self.engine.start(engine::IntegrationMethod::ImplicitEuler);
+                                self.engine.start_mt(engine::IntegrationMethod::ImplicitEuler, 1);
+                            }
+                        },
+                        49..=57 => {
+                            let threads = key - 48;
+                            if *self.engine.is_running.lock().unwrap() {
+                                self.engine.stop();
+                                thread::sleep(Duration::from_millis(200));
+                            } 
+                                // self.engine.start(engine::IntegrationMethod::ImplicitEuler);
+                            self.engine.start_mt(engine::IntegrationMethod::ImplicitEuler, threads as usize);
+                        }
+                        key => { println!("Key: {}", key) }
+                    }
+                }
+            }
             _ => { },
         }
 
@@ -161,39 +222,15 @@ impl DrawingApp {
             }
 
             FrameRect(hdc, rc, p.border as _);
-
-            
-            // SelectObject(hdc, p.pen as _);
-            // SelectObject(hdc, p.yellow as _);
-            // Ellipse(hdc, rc.left + 20, rc.top + 20, rc.right - 20, rc.bottom - 20);
-
-            // SelectObject(hdc, p.white as _);
-            // Ellipse(hdc, 60, 60, 130, 130);
-            // Ellipse(hdc, 150, 60, 220, 130);
-
-            // if self.clicked.get() {
-            //     SelectObject(hdc, p.red as _);
-            // } else {
-            //     SelectObject(hdc, p.black as _);
-            // }
-            
-            // Ellipse(hdc, 80, 80, 110, 110);
-            // Ellipse(hdc, 170, 80, 200, 110);
-
-            // SelectObject(hdc, p.red as _);
-            // let pts = &[P{x: 60, y: 150}, P{x: 220, y: 150}, P{x: 140, y: 220}];
-            // Polygon(hdc, pts.as_ptr(), pts.len() as _);
-
-            // let (x, y) = self.get_coords_from_timer();
-            // Ellipse(hdc, x - 10 + 140, y - 10 + 140, x + 10 + 140, y + 10 + 140);
         }
 
         paint.end_paint(&ps);
     }
 
     fn get_paint_objects(&self) -> Vec<(i32, i32, i32, HBRUSH)> {
-        let bodies = self.bodies.lock().unwrap();
-        let camera = self.camera.lock().unwrap();
+        let bodies = self.engine.objects.lock().unwrap().clone();
+        let mut camera = self.camera.lock().unwrap();
+        let mut target = self.current_target.lock().unwrap();
 
         let (screen_width_pix, screen_height_pix) = self.window.size();
         let w_128 = screen_width_pix as i128;
@@ -201,14 +238,25 @@ impl DrawingApp {
 
         let screen_scalar = screen_width_pix as f64 / 2.0 / (camera.fov / 2.0).to_radians().tan();
 
+        if !(*target).is_empty() {
+            camera.target = match bodies.iter().find(|x| x.name == *target) {
+                Some(b) => b.position.clone(),
+                None => {
+                    (*target).clear();
+                    Vector4d::default()
+                }
+            };
+        }
+        
         let transform = camera.get_full_transformation();
 
         let mut output: Vec<(i32, i32, i32, HBRUSH)> = Vec::new();
 
-        let camera_distances: Vec<_> = bodies.iter().map(|x| (x.name.clone(), x.position.distance(&camera.pos))).collect();
-
         let mut sorted_indices: Vec<usize> = (0..bodies.len()).collect();
-        sorted_indices.sort_by(|a, b| bodies[*b].cmp(&bodies[*a], &camera.pos));
+        sorted_indices.sort_by(|a, b| bodies[*b].cmp(&bodies[*a], &camera.get_position()));
+
+        let mut targets= self.targets.lock().unwrap();
+        targets.clear();
 
         for i in sorted_indices {
             let body = &bodies[i];
@@ -222,7 +270,9 @@ impl DrawingApp {
             
             let center_x = pos.data[0] / distance_scalar * screen_scalar;
             let center_y = pos.data[1] / distance_scalar * screen_scalar;
-            let radius = body.radius * body.magnification.powf(1.0 / 3.0) / camera.scale() / distance_scalar * screen_scalar;
+
+            let radius_without_mag = body.radius / camera.distance / distance_scalar * screen_scalar;
+            let radius_with_mag = radius_without_mag * body.magnification.powf(1.0 / 3.0);
 
             let res_x: i32 = match (center_x.round() as i128 + w_128 / 2).try_into() {
                 Ok(num) => num,
@@ -234,10 +284,19 @@ impl DrawingApp {
                 Err(_) => continue
             };
 
-            let res_radius: i32 = match (radius.round() as u128).try_into() {
+            let res_radius_without_mag: i32 = match (radius_without_mag.round() as u128).try_into() {
                 Ok(num) => num,
                 Err(_) => continue
             };
+
+            let res_radius_with_mag: i32 = match (radius_with_mag.round() as u128).try_into() {
+                Ok(num) => num,
+                Err(_) => continue
+            };
+
+            let max_magnification = 8;
+            let mut res_radius = if res_radius_without_mag < max_magnification { res_radius_with_mag.min(max_magnification) } else { res_radius_without_mag };
+            res_radius = res_radius.max(3);
 
             let [r, g, b] = body.color;
             output.push(
@@ -248,6 +307,7 @@ impl DrawingApp {
                     self.get_brush(r, g, b)
                 )
             );
+            targets.push(TargetData { name: body.name.clone(), x: res_x, y: res_y, radius: res_radius });
         }
 
         output
@@ -274,6 +334,7 @@ impl DrawingApp {
         
         unsafe {
             let brush = CreateSolidBrush(RGB(r, g, b));
+            
             let new_color = Color {r, g, b, brush};
             colors.push(new_color);
             brush
@@ -286,15 +347,23 @@ fn main() {
     nwg::Font::set_global_family("Segoe UI").expect("Failed to set default font");
 
     let mut _app = DrawingApp::build_ui(Default::default()).expect("Failed to build UI");
-    let engine = Engine::init(FRAMERATE);
+    *_app.engine.framerate.lock().unwrap() = FRAMERATE;
+    *_app.engine.target_speed.lock().unwrap() = 86400.0 * 1.0;
+    for _ in 0..500 {
+        let mut objects = _app.engine.objects.lock().unwrap();
+        let new_object = astronomy::AstronomicalObject::place_on_orbit(
+            astronomy::AstronomicalObject::get_random_planet(), 
+            &objects[0]
+        );
 
-    let (engine_handle, kill_request) = engine.start(_app.bodies.clone(), engine::IntegrationMethod::ImplicitEuler);
-
+        objects.push(
+            new_object
+        );
+    }
+    
     _app.animation_timer.start();        
     nwg::dispatch_thread_events();
 
-    kill_request.store(true, Ordering::Relaxed);
-
     // Make sure extra threads end cleanly
-    engine_handle.join().unwrap();
+    _app.engine.stop();
 }

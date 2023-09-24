@@ -1,251 +1,267 @@
-use itertools::izip;
-use std::sync::atomic::Ordering;
-use std::sync::{atomic::AtomicBool, Arc, Mutex, RwLock};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
+use std::thread;
+use std::time::Instant;
 
 use crate::astronomy::AstronomicalObject;
+use crate::integration;
 use crate::vector::Vector4d;
-pub const G: f64 = 6.6743E-11;
 
 pub enum IntegrationMethod {
     ImplicitEuler,
     RK4,
 }
 
-#[derive(Default)]
-struct IntermediateState {
-    mass: f64,
-    velocity: Vector4d,
-    dv: Vector4d,
-    position: Vector4d,
-}
-
-#[derive(Default)]
 pub struct Engine {
-    objects: Arc<RwLock<Vec<AstronomicalObject>>>,
-    framerate: u64,
+    pub objects: Arc<Mutex<Vec<AstronomicalObject>>>,
+    pub framerate: Arc<Mutex<u32>>,
+    pub target_speed: Arc<Mutex<f64>>,
+    pub is_running: Arc<Mutex<bool>>, // For outside communication
+    thread_stopped: Arc<Mutex<bool>>, // Thread communicates that it has cleanly ended
 }
 
 impl Engine {
-    pub fn init(framerate: u64) -> Engine {
-        Engine {
-            objects: Arc::new(RwLock::new(AstronomicalObject::default())),
-            framerate,
+    pub fn start_mt(&self, method: IntegrationMethod, num_threads: usize) {
+        let mut stopped = self.thread_stopped.lock().unwrap();
+        if !*stopped {
+            return;
         }
-    }
 
-    pub fn start(
-        &self,
-        object_buffer: Arc<Mutex<Vec<AstronomicalObject>>>,
-        method: IntegrationMethod,
-    ) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
-        let kill_request = Arc::new(AtomicBool::new(false));
-        let kill_clone = kill_request.clone();
+        *stopped = false;
+        *self.is_running.lock().unwrap() = true;
 
-        let mut objects_local = self.objects.read().unwrap().clone();
-        let integrate = match method {
-            IntegrationMethod::ImplicitEuler => Engine::semi_implicit_euler,
-            IntegrationMethod::RK4 => Engine::runge_kutta_4,
+        let objects_local = Arc::new(RwLock::new(self.objects.lock().unwrap().clone()));
+        let use_euler = match method {
+            IntegrationMethod::ImplicitEuler => true,
+            IntegrationMethod::RK4 => false,
         };
 
-        let framerate = self.framerate;
-        (
-            thread::spawn(move || {
-                let target_speed = 86400.0 * 1.0;  // 86400 seconds is a day
+        let target_speed_local = self.target_speed.clone();
+        let objects_shared = self.objects.clone();
+        let is_running_clone = self.is_running.clone();
+        let thread_stopped_clone = self.thread_stopped.clone();
 
-                let mut time_step = 1.0;
-                let mut i = 0;
-                let mut steps_until_update: u128;
-                let mut time_now = Instant::now();
+        let framerate = *self.framerate.lock().unwrap();
 
-                {
-                    let mut temp_objects = objects_local.clone();
-                    let mut counter = 0u128;
+        thread::spawn(move || {
+            let mut time_step = 0.001f64;
+            let mut i = 0;
+            let mut steps_until_update = 1000u128;
+            let mut time_now = Instant::now();
+            let mut num_objects = objects_local.read().unwrap().len();
 
-                    while (Instant::now() - time_now).as_secs_f64() < 0.2 {
-                        integrate(&mut temp_objects, time_step);
-                        counter += 1;
-                    }
+            let mut thread_results = Vec::with_capacity(num_threads);
+            (0..num_threads).for_each(|_| {
+                thread_results.push(Arc::new(Mutex::new(Vec::with_capacity(num_objects))))
+            });
 
-                    steps_until_update = counter * 5 / framerate as u128;
-                    println!("Initializing with {} iterations in a second", counter);
+            let work_queue = Arc::new(RwLock::new(Vec::with_capacity(num_threads)));
+            *work_queue.write().unwrap() = Engine::get_mt_splices(num_objects, num_threads);
+
+            let barrier = Arc::new(Barrier::new(num_threads + 1));
+            let worker_kill = Arc::new(AtomicBool::new(false));
+            let collision_signal = Arc::new(Mutex::new(false));
+
+            // Prepare threads if needed
+            if use_euler && num_threads > 1 {
+                for (i, thread_result) in thread_results.iter().enumerate() {
+                    let i_thread = i;
+                    let work_queue_lock = work_queue.clone();
+                    let objects_lock = objects_local.clone();
+                    let barrier_lock = barrier.clone();
+                    let result_lock = thread_result.clone();
+                    let kill_lock = worker_kill.clone();
+                    let collision_lock = collision_signal.clone();
+
+                    thread::spawn(move || {
+                        loop {
+                            barrier_lock.wait(); // Wait until main thread has assigned work
+
+                            if kill_lock.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+
+                            let (start, end) = work_queue_lock.read().unwrap()[i_thread];
+                            let objects = objects_lock.read().unwrap();
+
+                            let (vectors, collisions_found) =
+                                integration::semi_implicit_euler(&objects, start, end);
+
+                            if collisions_found {
+                                *collision_lock.lock().unwrap() = true;
+                            } else {
+                                // No need to even update result vectors if collisions are found
+                                let mut result_vectors = result_lock.lock().unwrap();
+                                *result_vectors = vectors;
+                            }
+
+                            barrier_lock.wait();
+                            // Important to have two barrier waits. Main thread prepares work between
+                        }
+
+                        println!("Worker thread killed");
+                    });
                 }
-                
-                loop {
-                    integrate(&mut objects_local, time_step);
-                    Engine::process_collisions(&mut objects_local);
+            }
 
-                    i += 1;
-                    if i >= steps_until_update {
-                        let new_time = Instant::now();
-                        let duration = (new_time - time_now).as_secs_f64();
+            loop {
+                if num_threads == 1 || !use_euler {
+                    let mut objects_local = objects_local.write().unwrap();
+                    if use_euler {
+                        while i < steps_until_update {
+                            let (acceleration_vectors, collisions_found) =
+                                integration::semi_implicit_euler(
+                                    &objects_local,
+                                    (0, 0),
+                                    (num_objects - 2, num_objects - 1),
+                                );
 
-                        let speed = if duration == 0.0 {
-                            steps_until_update as f64
+                            if collisions_found {
+                                // Only find collisions and perform object combining if they are found in integration
+                                integration::process_collisions(&mut objects_local);
+                            } else {
+                                for (body, vector) in
+                                    objects_local.iter_mut().zip(acceleration_vectors)
+                                {
+                                    body.velocity.add_mut(&vector.multiply(time_step));
+                                    body.position.add_mut(&body.velocity.multiply(time_step));
+                                }
+                            }
+
+                            i += 1;
+                        }
+                    } else {
+                        while i < steps_until_update {
+                            let collisions_found =
+                                integration::runge_kutta_4(&mut objects_local, time_step);
+
+                            if collisions_found {
+                                // Only find collisions and perform object combining if they are found in integration
+                                integration::process_collisions(&mut objects_local);
+                            }
+
+                            i += 1;
+                        }
+                    }
+                } else {
+                    while i < steps_until_update {
+                        barrier.wait(); // Release worker threads to do work
+                        barrier.wait(); // Work is completed, now we can gather results
+
+                        let mut objects = objects_local.write().unwrap();
+                        let mut collisions_lock = collision_signal.lock().unwrap();
+
+                        if *collisions_lock {
+                            // Only process collisions if threads found one in integration
+                            integration::process_collisions(&mut objects);
+                            num_objects = objects.len();
+
+                            *work_queue.write().unwrap() =
+                                Engine::get_mt_splices(num_objects, num_threads);
+                            *collisions_lock = false;
                         } else {
-                            steps_until_update as f64 / duration
-                        };
+                            let mut acceleration_vectors = vec![Vector4d::default(); num_objects];
 
-                        i = 0;
-                        steps_until_update = (speed / framerate as f64).round() as u128;
-                        time_step = target_speed / speed;
-                        time_now = new_time;
+                            for lock in &thread_results {
+                                let thread_vectors = lock.lock().unwrap();
+                                for (acc_vector, thread_vector) in
+                                    acceleration_vectors.iter_mut().zip(thread_vectors.iter())
+                                {
+                                    acc_vector.add_mut(thread_vector);
+                                }
+                            }
 
-                        {
-                            let mut objects_shared = object_buffer.lock().unwrap();
-                            objects_shared.clear();
-                            objects_local
-                                .iter()
-                                .for_each(|o| objects_shared.push(o.clone()));
+                            for (body, vector) in objects.iter_mut().zip(acceleration_vectors) {
+                                body.velocity.add_mut(&vector.multiply(time_step));
+                                body.position.add_mut(&body.velocity.multiply(time_step));
+                            }
                         }
 
-                        if kill_clone.load(Ordering::Relaxed) {
-                            break;
-                        }
+                        i += 1;
                     }
                 }
-            }),
-            kill_request,
-        )
-    }
 
-    fn runge_kutta_4(local_bodies: &mut Vec<AstronomicalObject>, time_step: f64) {
-        let mut dt = 0.0f64;
-        let num_bodies = local_bodies.len();
+                let new_time = Instant::now();
+                let duration = (new_time - time_now).as_secs_f64();
 
-        let mut s: [Vec<IntermediateState>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+                let speed = if duration == 0.0 {
+                    steps_until_update as f64
+                } else {
+                    steps_until_update as f64 / duration
+                };
 
-        for state in 0..4 {
-            if state == 1 || state == 3 {
-                dt += 0.5 * time_step;
-            }
+                i = 0;
+                steps_until_update = (speed / framerate as f64).round() as u128;
+                time_step = *target_speed_local.lock().unwrap() / speed;
 
-            let mut positions: Vec<_> = local_bodies.iter().map(|x| x.position).collect();
-            let mut dv = vec![Vector4d::default(); num_bodies];
+                time_now = new_time;
 
-            if state >= 1 {
-                for (position, prev_state) in positions.iter_mut().zip(&s[state - 1]) {
-                    position.add_mut(&prev_state.velocity.multiply(dt));
-                }
-            }
+                println!("Speed: {:.1}", speed);
+                // println!("Time step: {:.4}", time_step);
 
-            for i in 0..num_bodies - 1 {
-                for j in i + 1..num_bodies {
-                    let difference = positions[j].substract(&positions[i]);
-                    let grav_modifier = G / (difference.length().powi(3));
+                let mut objects_shared = objects_shared.lock().unwrap();
+                objects_shared.clear();
+                objects_local
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .for_each(|o| objects_shared.push(o.clone()));
 
-                    dv[i].add_mut(&difference.multiply(grav_modifier * local_bodies[j].mass));
-                    dv[j].add_mut(&difference.multiply(-grav_modifier * local_bodies[i].mass));
-                }
-            }
-
-            s[state] = (0..num_bodies)
-                .map(|i| IntermediateState {
-                    mass: local_bodies[i].mass,
-                    velocity: if state == 0 {
-                        local_bodies[i].velocity
-                    } else {
-                        local_bodies[i]
-                            .velocity
-                            .add(&s[state - 1][i].dv.multiply(dt))
-                    },
-                    position: positions[i],
-                    dv: dv[i],
-                })
-                .collect();
-        }
-
-        for (i, body) in local_bodies.iter_mut().enumerate() {
-            let mut dxdt = s[0][i]
-                .velocity
-                .add(&s[1][i].velocity.add(&s[2][i].velocity).multiply(2.0))
-                .add(&s[3][i].velocity)
-                .multiply(1.0 / 6.0);
-
-            let mut dvdt = s[0][i]
-                .dv
-                .add(&s[1][i].dv.add(&s[2][i].dv).multiply(2.0))
-                .add(&s[3][i].dv)
-                .multiply(1.0 / 6.0);
-
-            body.velocity.add_mut(dvdt.multiply_mut(time_step));
-            body.position.add_mut(dxdt.multiply_mut(time_step));
-        }
-    }
-
-    fn semi_implicit_euler(local_bodies: &mut Vec<AstronomicalObject>, time_step: f64) {
-        let len = local_bodies.len();
-        let mut acceleration_vectors = vec![Vector4d::default(); len];
-
-        for first in 0..len - 1 {
-            for second in first + 1..len {
-                let (a, b) = (&local_bodies[first], &local_bodies[second]);
-
-                let difference = b.position.substract(&a.position);
-                let grav_mult = G / (difference.length().powi(3)); // Divide by r^3 to get a unit vector out of difference
-
-                acceleration_vectors[first].add_mut(&difference.multiply(grav_mult * b.mass));
-                acceleration_vectors[second].add_mut(&difference.multiply(-grav_mult * a.mass));
-            }
-        }
-
-        for (i, body) in local_bodies.iter_mut().enumerate() {
-            body.velocity
-                .add_mut(acceleration_vectors[i].multiply_mut(time_step));
-            body.position.add_mut(&body.velocity.multiply(time_step));
-        }
-    }
-
-    fn process_collisions(local_objects: &mut Vec<AstronomicalObject>) {
-        let obs = local_objects;
-        'collision_loop: loop {
-            let len = obs.len();
-            for i in 0..len - 1 {
-                for j in i + 1..len {
-                    // No collision
-                    if obs[i].position.distance(&obs[j].position) > obs[i].radius + obs[j].radius {
-                        continue;
+                if !*is_running_clone.lock().unwrap() {
+                    *thread_stopped_clone.lock().unwrap() = true;
+                    if num_threads > 1 {
+                        worker_kill.store(true, std::sync::atomic::Ordering::Relaxed);
+                        barrier.wait(); // Release threads to see the kill request
                     }
-
-                    let (heavy, light) = if obs[i].mass >= obs[j].mass {
-                        (i, j)
-                    } else {
-                        (j, i)
-                    };
-                    let total_mass = obs[i].mass + obs[j].mass;
-
-                    obs[heavy].velocity = obs[heavy]
-                        .velocity
-                        .multiply(obs[heavy].mass)
-                        .add(&obs[light].velocity.multiply(obs[light].mass))
-                        .multiply(1.0 / total_mass);
-                    obs[heavy].position = obs[heavy].position.add(
-                        &obs[light]
-                            .position
-                            .substract(&obs[heavy].position)
-                            .multiply(obs[light].mass / total_mass),
-                    );
-
-                    obs[heavy].radius *= (total_mass / obs[heavy].mass).powf(1.0 / 3.0);
-
-                    println!("{} collided into {}!", obs[light].name, obs[heavy].name);
-
-                    obs.remove(light);
-                    continue 'collision_loop;
+                    break;
                 }
             }
-            break;
-        }
+        });
     }
 
-    // fn general_rk(
-    //     local_bodies: &mut Vec<AstronomicalObject>,
-    //     time_step: f64,
-    //     stages: u32,
-    //     tableau: Vec<Vec<f64>>,
-    // ) {
-    //     let mut k: Vec<IntermediateState> = Vec::new();
-    //     for s in 0..stages {}
-    // }
+    pub fn stop(&self) {
+        *self.is_running.lock().unwrap() = false;
+    }
+
+    fn get_mt_splices(
+        num_bodies: usize,
+        num_threads: usize,
+    ) -> Vec<((usize, usize), (usize, usize))> {
+        if num_bodies < 2 {
+            return Vec::new();
+        }
+
+        let mut combinations = Vec::new();
+        for i in 0..num_bodies - 1 {
+            for j in i + 1..num_bodies {
+                combinations.push((i, j));
+            }
+        }
+
+        let len = combinations.len();
+        let mut buckets = Vec::new();
+        for i in 0..num_threads {
+            let mut num = if i < len % num_threads { 1 } else { 0 };
+            num += len / num_threads;
+
+            let bucket = combinations.split_off(combinations.len() - num);
+            let (a, b) = bucket.first().unwrap();
+            let (c, d) = bucket.last().unwrap();
+            buckets.push(((*a, *b), (*c, *d)));
+        }
+
+        buckets
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Engine {
+            objects: Arc::new(Mutex::new(AstronomicalObject::default())),
+            framerate: Arc::new(Mutex::new(60)),
+            target_speed: Arc::new(Mutex::new(86400.0 * 1.0)),
+            is_running: Arc::new(Mutex::new(false)),
+            thread_stopped: Arc::new(Mutex::new(true)),
+        }
+    }
 }

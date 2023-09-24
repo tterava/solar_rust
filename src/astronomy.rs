@@ -1,19 +1,13 @@
-//                 bodies.Add(new CelestialBody("Jupiter", 1.8986E27, new Vector3D(0, 5.20260 * AU, 0), new Vector3D(-13070, 0, 0), 71492, 1E6, Brushes.GhostWhite));
-//                 bodies.Add(new CelestialBody("Europa", 5.799844E22, new Vector3D(0, 5.20260 * AU + 670900, 0), new Vector3D(-13070 - 13740, 0, 0), 1560.8, 1E6, Brushes.LightYellow));
-//                 bodies.Add(new CelestialBody("Saturn", 5.6836E26, new Vector3D(9.554909 * AU, 0, 0), new Vector3D(0, 9690, 0), 58232, 1E6, Brushes.Gray));
-
-//                 bodies.Add(new CelestialBody("Monster", 6E30, new Vector3D(90 * AU, 4 * AU, 0), new Vector3D(-11000, 0, 0), 10E5, 50, Brushes.Bisque));
-
 use std::cmp::Ordering;
 use std::f64::consts::PI;
 
-use crate::engine::G;
+use crate::integration::G;
 use crate::matrix::Matrix4d;
 use crate::vector::Vector4d;
 
 use rand::Rng;
 
-const AU: f64 = 1.495978707E11;
+pub const AU: f64 = 1.495978707E11;
 
 pub enum OrbitalMethod {
     Radius(f64),
@@ -44,7 +38,7 @@ pub struct AstronomicalObject {
     pub velocity: Vector4d,
     pub radius: f64,
     pub magnification: f64,
-    pub color: [u8; 3],
+    pub color: [u8; 3]
 }
 
 impl AstronomicalObject {
@@ -92,7 +86,7 @@ impl AstronomicalObject {
                 positive_y_rotation: true,
                 method: OrbitalMethod::Radius(AU),
                 inclination: Inclination::Fixed(0.0),
-                magnification: 2.0E7,
+                magnification: 1.0E7,
                 color: [0, 0, 255],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
@@ -105,7 +99,7 @@ impl AstronomicalObject {
                 positive_y_rotation: true,
                 method: OrbitalMethod::Radius(384399E3),
                 inclination: Inclination::Fixed(5.145f64.to_radians()),
-                magnification: 2.0E7,
+                magnification: 1.0E7,
                 color: [255, 255, 255],
             },
             system.iter().find(|x| x.name == "Earth").unwrap(),
@@ -202,21 +196,35 @@ impl AstronomicalObject {
             system.iter().find(|x| x.name == "Mars").unwrap(),
         ));
 
-        // AstronomicalObject {
-        //     name: "Monster".to_string(),
-        //     mass: 2E31,
-        //     position: Vector4d {
-        //         data: [-8.0 * AU, 2.0 * AU, 8.0 * AU, 1.0],
-        //     },
-        //     velocity: Vector4d {
-        //         data: [60.0E3, 0.0, -60.43E3, 1.0],
-        //     },
-        //     radius: 695700.0E3,
-        //     magnification: 500.0,
-        //     color: [230, 155, 200],
-        // },
+        // Never 4get
+        system.push(AstronomicalObject::place_on_orbit(
+            OrbitalObject {
+                name: "Pluto".to_string(),
+                mass: 1.303E22,
+                radius: 2376.6E3,
+                positive_y_rotation: true,
+                method: OrbitalMethod::Radius(39.482 * AU),
+                inclination: Inclination::Fixed(17.16f64.to_radians()),
+                magnification: 2.0E7,
+                color: [190, 190, 255],
+            },
+            system.iter().find(|x| x.name == "Sun").unwrap(),
+        ));
 
-        // system.iter_mut().for_each(|x| x.randomize_orbit());
+        // system.push(AstronomicalObject::place_on_orbit(
+        //     OrbitalObject {
+        //         name: "Monster".to_string(),
+        //         mass: 2E31,
+        //         radius: 1E9,
+        //         positive_y_rotation: false,
+        //         method: OrbitalMethod::Radius(0.4 * AU),
+        //         inclination: Inclination::Random(90.0f64.to_radians()),
+        //         magnification: 2.0E11,
+        //         color: [150, 0, 150],
+        //     },
+        //     system.iter().find(|x| x.name == "Sun").unwrap(),
+        // ));
+
         system
     }
 
@@ -264,18 +272,19 @@ impl AstronomicalObject {
             Inclination::Random(a) => rng.gen_range(0.0..=a),
         };
 
-        let rot_z = Matrix4d::rot_z(inclination_angle);
         let rot_y = Matrix4d::rot_y(rng.gen_range(0.0..2.0 * PI));
+        let rot_z = Matrix4d::rot_z(inclination_angle);
+        let rot_y_2 = Matrix4d::rot_y(rng.gen_range(0.0..2.0 * PI));
+        let translate_pos = Matrix4d::trans(&target.position.multiply(-1.0));
+        let translate_vel = Matrix4d::trans(&target.velocity.multiply(-1.0));
 
-        velocity = rot_z * &velocity; // Tilt the orbit
+        let matrix_pos = translate_pos * rot_y_2 * rot_z * rot_y;
+        let matrix_vel = translate_vel * rot_y_2 * rot_z * rot_y;
 
-        position = rot_y * &position;
-        velocity = rot_y * &velocity;
-
-        position = target.position.add(&position);
-        velocity = target.velocity.add(&velocity);
-
-        let ret = AstronomicalObject {
+        velocity = matrix_vel * &velocity;
+        position = matrix_pos * &position;
+        
+        AstronomicalObject {
             name: obj.name,
             mass: obj.mass,
             position,
@@ -283,13 +292,21 @@ impl AstronomicalObject {
             radius: obj.radius,
             magnification: obj.magnification,
             color: obj.color,
-        };
+        }
+    }
 
-        // println!("Placing: {}", ret.name);
-        // println!("Speed: {}", ret.velocity.length());
-        // println!("Distance from origin: {}", position.length());
-        // println!("Inclination: {:.2} degrees", inclination_angle.to_degrees());
-
-        ret
+    pub fn get_random_planet() -> OrbitalObject {
+        let mut rng = rand::thread_rng();
+        OrbitalObject {
+            name: rng.gen_range(0..=1000000).to_string(),
+            mass: rng.gen_range(1.972168E24..=6.8982E27),
+            radius: rng.gen_range(6000E3..=150000E3),
+            // positive_y_rotation: rng.gen_bool(0.5),
+            positive_y_rotation: true,
+            method: OrbitalMethod::Radius(rng.gen_range(0.5..=20.0) * AU),
+            inclination: Inclination::Random(10.0f64.to_radians()),
+            magnification: 2.0E7,
+            color: [rng.gen_range(0..=255), rng.gen_range(0..=255), rng.gen_range(0..=255)],
+        }        
     }
 }
