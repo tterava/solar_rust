@@ -1,20 +1,59 @@
-use crate::{astronomy::AstronomicalObject, vector::Vector4d};
+use crate::{astronomy::AstronomicalObject, vector::Vector3d};
 
 pub const G: f64 = 6.6743E-11;
 
-#[derive(Default)]
-struct IntermediateState {
-    velocity: Vector4d,
-    dv: Vector4d,
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum IntegrationMethod {
+    Symplectic(u8),
+    RK4,
 }
 
-pub fn runge_kutta_4(local_bodies: &mut Vec<AstronomicalObject>, time_step: f64) -> bool {
+// c and d coefficients for symplectic integrator
+impl IntegrationMethod {
+    pub fn get_coefficients(&self) -> Vec<(f64, f64)> {
+        match &self {
+            IntegrationMethod::Symplectic(k) => match k {
+                1 => vec![(1.0, 1.0)],
+                2 => vec![(0.0, 0.5), (1.0, 0.5)],
+                3 => vec![
+                    (1.0, -1.0 / 24.0),
+                    (-2.0 / 3.0, 3.0 / 4.0),
+                    (2.0 / 3.0, 7.0 / 24.0),
+                ],
+                4 => vec![
+                    (
+                        1.0 / 2.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                        1.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                    ),
+                    (
+                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / 2.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                        -(2.0f64.powf(1.0 / 3.0) / (2.0 - 2.0f64.powf(1.0 / 3.0))),
+                    ),
+                    (
+                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / 2.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                        1.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                    ),
+                    (1.0 / 2.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)), 0.0),
+                ],
+                _ => vec![],
+            },
+            _ => vec![],
+        }
+    }
+}
+
+#[derive(Default)]
+struct IntermediateState {
+    velocity: Vector3d,
+    dv: Vector3d,
+}
+
+pub fn runge_kutta_4(
+    local_bodies: &mut Vec<AstronomicalObject>,
+    time_step: f64,
+) -> Result<(), (usize, usize)> {
     let mut dt = 0.0f64;
     let num_bodies = local_bodies.len();
-
-    if num_bodies == 0 {
-        return false;
-    }
 
     let mut s: [Vec<IntermediateState>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
@@ -24,7 +63,7 @@ pub fn runge_kutta_4(local_bodies: &mut Vec<AstronomicalObject>, time_step: f64)
         }
 
         let mut positions: Vec<_> = local_bodies.iter().map(|x| x.position.clone()).collect();
-        let mut dv = vec![Vector4d::default(); num_bodies];
+        let mut dv = vec![Vector3d::default(); num_bodies];
 
         if state >= 1 {
             for (position, prev_state) in positions.iter_mut().zip(&s[state - 1]) {
@@ -38,8 +77,7 @@ pub fn runge_kutta_4(local_bodies: &mut Vec<AstronomicalObject>, time_step: f64)
                 let distance = difference.length();
 
                 if state == 0 && distance <= local_bodies[i].radius + local_bodies[j].radius {
-                    println!("Found collision, ending integration early");
-                    return true;  // Process collisions before update results
+                    return Err((i, j)); // Process collisions before update results
                 }
                 let grav_modifier = G / (difference.length().powi(3));
 
@@ -65,40 +103,39 @@ pub fn runge_kutta_4(local_bodies: &mut Vec<AstronomicalObject>, time_step: f64)
     for (i, body) in local_bodies.iter_mut().enumerate() {
         let mut dxdt = s[0][i]
             .velocity
-            .add(&s[1][i].velocity.add(&s[2][i].velocity).multiply(2.0))
-            .add(&s[3][i].velocity)
-            .multiply(1.0 / 6.0);
+            .add(s[1][i].velocity.add(&s[2][i].velocity).multiply_mut(2.0));
+
+        dxdt.add_mut(&s[3][i].velocity).multiply_mut(1.0 / 6.0);
 
         let mut dvdt = s[0][i]
             .dv
-            .add(&s[1][i].dv.add(&s[2][i].dv).multiply(2.0))
-            .add(&s[3][i].dv)
-            .multiply(1.0 / 6.0);
+            .add(s[1][i].dv.add(&s[2][i].dv).multiply_mut(2.0));
+
+        dvdt.add_mut(&s[3][i].dv).multiply_mut(1.0 / 6.0);
 
         body.velocity.add_mut(dvdt.multiply_mut(time_step));
         body.position.add_mut(dxdt.multiply_mut(time_step));
     }
 
-    false
+    Ok(())
 }
 
-
-pub fn semi_implicit_euler(local_bodies: &Vec<AstronomicalObject>, start: (usize, usize), end: (usize, usize)) -> (Vec<Vector4d>, bool) {
+// https://en.wikipedia.org/wiki/Symplectic_integrator
+pub fn symplectic(
+    local_bodies: &Vec<AstronomicalObject>,
+    start: (usize, usize),
+    end: (usize, usize),
+) -> Result<Vec<Vector3d>, (usize, usize)> {
     let num_bodies = local_bodies.len();
+    let mut acceleration_vectors = vec![Vector3d::default(); num_bodies];
 
-    if num_bodies == 0 {
-        return (Vec::new(), false);
-    }
-
-    let mut acceleration_vectors = vec![Vector4d::default(); num_bodies];
-    
     let start_i = start.0;
     let start_j = start.1;
 
     let end_i = end.0;
     let end_j = end.1;
 
-    'outer_loop: for first in start_i ..= end_i {
+    'outer_loop: for first in start_i..=end_i {
         for second in first + 1..num_bodies {
             if first == start_i && second < start_j {
                 continue;
@@ -113,8 +150,7 @@ pub fn semi_implicit_euler(local_bodies: &Vec<AstronomicalObject>, start: (usize
             let distance = difference.length();
 
             if distance <= a.radius + b.radius {
-                println!("Found collision, ending integration early");
-                return (acceleration_vectors, true);  // Process collisions before update results
+                return Err((first, second)); // Process collisions before update results
             }
             let grav_mult = G / (distance.powi(3)); // Divide by r^3 to get a unit vector out of difference
 
@@ -123,62 +159,36 @@ pub fn semi_implicit_euler(local_bodies: &Vec<AstronomicalObject>, start: (usize
         }
     }
 
-    (acceleration_vectors, false)
+    Ok(acceleration_vectors)
 }
 
-
-pub fn process_collisions(local_objects: &mut Vec<AstronomicalObject>) {
+pub fn collide_objects(
+    local_objects: &mut Vec<AstronomicalObject>,
+    (first, second): &(usize, usize),
+) {
     let obs = local_objects;
-    'collision_loop: loop {
-        let len = obs.len();
-        if len == 0 {
-            return;
-        }
+    let (h, l) = if obs[*first].mass >= obs[*second].mass {
+        (*first, *second)
+    } else {
+        (*second, *first)
+    };
 
-        for i in 0..len - 1 {
-            'inner_loop: for j in i + 1..len {
-                let combined_radius = obs[i].radius + obs[j].radius;
-                let (pos1, pos2) = (obs[i].position.data, obs[j].position.data);
+    let total_mass = obs[h].mass + obs[l].mass;
+    obs[h].velocity = obs[h]
+        .velocity
+        .multiply(obs[h].mass)
+        .add(&obs[l].velocity.multiply(obs[l].mass))
+        .multiply(1.0 / total_mass);
 
-                // Quick bounding box check
-                for k in 0..3 {
-                    if (pos1[k] - pos2[k]).abs() > combined_radius {
-                        continue 'inner_loop;
-                    }
-                }
+    obs[h].position = obs[h].position.add(
+        &obs[l]
+            .position
+            .substract(&obs[h].position)
+            .multiply(obs[l].mass / total_mass),
+    );
 
-                // Slower exact check
-                if obs[i].position.distance(&obs[j].position) > combined_radius {
-                    continue;
-                }
+    obs[h].radius *= (total_mass / obs[h].mass).powf(1.0 / 3.0);
 
-                let (heavy, light) = if obs[i].mass >= obs[j].mass {
-                    (i, j)
-                } else {
-                    (j, i)
-                };
-                let total_mass = obs[i].mass + obs[j].mass;
-
-                obs[heavy].velocity = obs[heavy]
-                    .velocity
-                    .multiply(obs[heavy].mass)
-                    .add(&obs[light].velocity.multiply(obs[light].mass))
-                    .multiply(1.0 / total_mass);
-                obs[heavy].position = obs[heavy].position.add(
-                    &obs[light]
-                        .position
-                        .substract(&obs[heavy].position)
-                        .multiply(obs[light].mass / total_mass),
-                );
-
-                obs[heavy].radius *= (total_mass / obs[heavy].mass).powf(1.0 / 3.0);
-
-                println!("{} collided into {}!", obs[light].name, obs[heavy].name);
-
-                obs.remove(light);
-                continue 'collision_loop;
-            }
-        }
-        break;
-    }
+    println!("{} collided into {}!", obs[l].name, obs[h].name);
+    obs.remove(l);
 }

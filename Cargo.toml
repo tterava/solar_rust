@@ -14,3 +14,4 @@ winapi = { version = "0.3", features = [
   "commdlg", "d2d1", "objbase", "dwrite", "winnls", "shellapi", "wincodec", "stringapiset"] }
 rand = "0.8.5"
 winput = "0.2.5"
+uuid = { version = "1.4.1" , features = [ "v4", "fast-rng" ] }

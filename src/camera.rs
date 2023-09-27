@@ -21,9 +21,6 @@ impl Camera {
     pub fn get_pitch(&self) -> f64 {
         self.pitch
     }
-    pub fn add_pitch(&mut self, angle: f64) {
-        self.set_pitch(self.pitch + angle);
-    }
     pub fn set_pitch(&mut self, angle: f64) {
         // Limit pitch between -89.9 degrees and 89.9 degrees or things go upside down.
         self.pitch = angle.min(PI / 180.0 * 89.9).max(-PI / 180.0 * 89.9);
@@ -31,9 +28,6 @@ impl Camera {
 
     pub fn get_yaw(&self) -> f64 {
         self.yaw
-    }
-    pub fn add_yaw(&mut self, angle: f64) {
-        self.set_yaw(self.yaw + angle);
     }
     pub fn set_yaw(&mut self, angle: f64) {
         self.yaw = angle % (2.0 * PI);

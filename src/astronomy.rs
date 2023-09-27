@@ -3,11 +3,13 @@ use std::f64::consts::PI;
 
 use crate::integration::G;
 use crate::matrix::Matrix4d;
-use crate::vector::Vector4d;
+use crate::vector::{Vector3d, Vector4d};
 
 use rand::Rng;
+use uuid::Uuid;
 
 pub const AU: f64 = 1.495978707E11;
+pub const SOLAR_MASS: f64 = 1.98847E30;
 
 pub enum OrbitalMethod {
     Radius(f64),
@@ -34,23 +36,27 @@ pub struct OrbitalObject {
 pub struct AstronomicalObject {
     pub name: String,
     pub mass: f64,
-    pub position: Vector4d,
-    pub velocity: Vector4d,
+    pub position: Vector3d,
+    pub velocity: Vector3d,
+    pub acceleration: Vector3d,
     pub radius: f64,
     pub magnification: f64,
-    pub color: [u8; 3]
+    pub color: [u8; 3],
+    pub uuid: Uuid
 }
 
 impl AstronomicalObject {
     pub fn default() -> Vec<AstronomicalObject> {
         let mut system = vec![AstronomicalObject {
             name: "Sun".to_string(),
-            mass: 1.9885E30,
-            position: Vector4d::default(),
-            velocity: Vector4d::default(),
+            mass: SOLAR_MASS,
+            position: Vector3d::default(),
+            velocity: Vector3d::default(),
+            acceleration: Vector3d::default(),
             radius: 695700.0E3,
             magnification: 100.0,
             color: [255, 255, 0],
+            uuid: Uuid::new_v4()
         }];
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -98,12 +104,27 @@ impl AstronomicalObject {
                 radius: 1737.4E3,
                 positive_y_rotation: true,
                 method: OrbitalMethod::Radius(384399E3),
+                // inclination: Inclination::Fixed(0.0f64.to_radians()),
                 inclination: Inclination::Fixed(5.145f64.to_radians()),
                 magnification: 1.0E7,
                 color: [255, 255, 255],
             },
             system.iter().find(|x| x.name == "Earth").unwrap(),
         ));
+        // system.push(AstronomicalObject::place_on_orbit(
+        //     OrbitalObject {
+        //         name: "Moon2".to_string(),
+        //         mass: 7.342E22,
+        //         radius: 1737.4E3,
+        //         positive_y_rotation: false,
+        //         method: OrbitalMethod::Radius(384399E3),
+        //         inclination: Inclination::Fixed(0.0f64.to_radians()),
+        //         // inclination: Inclination::Fixed(5.145f64.to_radians()),
+        //         magnification: 1.0E7,
+        //         color: [255, 255, 255],
+        //     },
+        //     system.iter().find(|x| x.name == "Earth").unwrap(),
+        // ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
                 name: "Mars".to_string(),
@@ -196,7 +217,7 @@ impl AstronomicalObject {
             system.iter().find(|x| x.name == "Mars").unwrap(),
         ));
 
-        // Never 4get
+        // // Never 4get
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
                 name: "Pluto".to_string(),
@@ -210,6 +231,31 @@ impl AstronomicalObject {
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
         ));
+
+        system.push(AstronomicalObject::place_on_orbit(
+            OrbitalObject {
+                name: "Internation Space Station".to_string(),
+                mass: 450.0E3,
+                radius: 100.0,
+                positive_y_rotation: true,
+                method: OrbitalMethod::Radius(6371.0E3 + 418000.0),
+                inclination: Inclination::Fixed(51.64f64.to_radians()),
+                magnification: 1.0E7,
+                color: [0, 0, 160],
+            },
+            system.iter().find(|x| x.name == "Earth").unwrap(),
+        ));
+
+        // system.push(AstronomicalObject {
+        //     name: "Neutron star".into(),
+        //     mass: 1.4 * SOLAR_MASS,
+        //     position: Vector3d { data: [-1.3 * AU, 0.0, 50.0 * AU] },
+        //     velocity: Vector3d { data: [0.0, 0.0, -32000.0] },
+        //     acceleration: Vector3d::default(),
+        //     radius: 10000.0,
+        //     magnification: 1.0E7,
+        //     color: [255, 255, 255],
+        // });
 
         // system.push(AstronomicalObject::place_on_orbit(
         //     OrbitalObject {
@@ -228,7 +274,7 @@ impl AstronomicalObject {
         system
     }
 
-    pub fn cmp(&self, other: &AstronomicalObject, target: &Vector4d) -> Ordering {
+    pub fn cmp(&self, other: &AstronomicalObject, target: &Vector3d) -> Ordering {
         let a = self.position.distance_squared(target);
         let b = other.position.distance_squared(target);
 
@@ -275,38 +321,49 @@ impl AstronomicalObject {
         let rot_y = Matrix4d::rot_y(rng.gen_range(0.0..2.0 * PI));
         let rot_z = Matrix4d::rot_z(inclination_angle);
         let rot_y_2 = Matrix4d::rot_y(rng.gen_range(0.0..2.0 * PI));
-        let translate_pos = Matrix4d::trans(&target.position.multiply(-1.0));
-        let translate_vel = Matrix4d::trans(&target.velocity.multiply(-1.0));
+        let translate_pos = Matrix4d::trans(&target.position.to_4d().multiply(-1.0));
+        let translate_vel = Matrix4d::trans(&target.velocity.to_4d().multiply(-1.0));
 
         let matrix_pos = translate_pos * rot_y_2 * rot_z * rot_y;
         let matrix_vel = translate_vel * rot_y_2 * rot_z * rot_y;
 
         velocity = matrix_vel * &velocity;
         position = matrix_pos * &position;
-        
+
         AstronomicalObject {
             name: obj.name,
             mass: obj.mass,
-            position,
-            velocity,
+            position: position.to_3d(),
+            velocity: velocity.to_3d(),
+            acceleration: Vector3d::default(),
             radius: obj.radius,
             magnification: obj.magnification,
             color: obj.color,
+            uuid: Uuid::new_v4()
         }
     }
 
     pub fn get_random_planet() -> OrbitalObject {
         let mut rng = rand::thread_rng();
+
+        let density_earth = 5.972168E24 / 6371.0E3f64.powi(3);
+        let mass = rng.gen_range(1.303E22..=6.8982E27);
+        let radius = (mass / density_earth).powf(1.0 / 3.0);
+
         OrbitalObject {
             name: rng.gen_range(0..=1000000).to_string(),
-            mass: rng.gen_range(1.972168E24..=6.8982E27),
-            radius: rng.gen_range(6000E3..=150000E3),
+            mass,
+            radius,
             // positive_y_rotation: rng.gen_bool(0.5),
             positive_y_rotation: true,
             method: OrbitalMethod::Radius(rng.gen_range(0.5..=20.0) * AU),
-            inclination: Inclination::Random(10.0f64.to_radians()),
-            magnification: 2.0E7,
-            color: [rng.gen_range(0..=255), rng.gen_range(0..=255), rng.gen_range(0..=255)],
-        }        
+            inclination: Inclination::Random(30.0f64.to_radians()),
+            magnification: 1.0E7,
+            color: [
+                rng.gen_range(0..=255),
+                rng.gen_range(0..=255),
+                rng.gen_range(0..=255),
+            ],
+        }
     }
 }
