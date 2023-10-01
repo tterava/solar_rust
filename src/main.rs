@@ -20,10 +20,11 @@ use crate::integration::IntegrationMethod;
 extern crate native_windows_gui as nwg;
 extern crate native_windows_derive as nwd;
 
+use astronomy::AstronomicalObject;
 use nwd::NwgUi;
 use nwg::{NativeUi, ExternCanvas, Window};
 use uuid::Uuid;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use std::mem;
 use std::cell::RefCell;
@@ -31,7 +32,7 @@ use std::sync::{Mutex, Arc};
 use winapi::shared::windef::{HBRUSH, HPEN, HFONT};
 use winapi::um::wingdi::{CreateSolidBrush, CreatePen, Ellipse, SelectObject, RGB, PS_SOLID, CreateFontW, FW_NORMAL, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, FF_DONTCARE, TextOutW, SetBkMode, TRANSPARENT, SetTextColor, FW_BOLD, CreateCompatibleDC, CreateCompatibleBitmap, BitBlt, SRCCOPY, DeleteObject, DeleteDC};
 
-const FRAMERATE: u32 = 100;
+const FRAMERATE: u32 = 170;
 
 pub struct PaintData {
     background: HBRUSH,
@@ -51,9 +52,9 @@ pub struct Color {
 
 struct TargetData {
     uuid: Uuid,
-    x: i32,
-    y: i32,
-    radius: i32
+    x: f64,
+    y: f64,
+    radius: f64
 }
 
 impl Default for PaintData {
@@ -64,7 +65,7 @@ impl Default for PaintData {
 
 #[derive(NwgUi)]
 pub struct DrawingApp {
-    #[nwg_control(size: (960, 540), position: (200, 200), title: "Solar system simulator", flags: "WINDOW|VISIBLE|RESIZABLE")]
+    #[nwg_control(size: (960, 540), position: (200, 200), title: "Solar system simulator", flags: "MAIN_WINDOW|VISIBLE")]
     #[nwg_events( 
         OnWindowClose: [nwg::stop_thread_dispatch()], 
         OnInit: [DrawingApp::setup], 
@@ -164,8 +165,6 @@ impl DrawingApp {
             *self.next_status_update.borrow_mut() = Instant::now() + Duration::from_millis(500);
         }
 
-        let (_, screen_height) = self.window.size();
-
         use winapi::um::winuser::{FillRect, FrameRect};
         
         let paint = data.on_paint();
@@ -184,29 +183,9 @@ impl DrawingApp {
             FillRect(mem_dc, rc, p.background as _);
             SelectObject(mem_dc, p.pen as _);
 
-            for (x, y, r, brush) in paint_objects.iter() {
-                let left: i32 = match x.checked_sub(*r) {
-                    Some(x) => x,
-                    None => continue
-                };
-
-                let right: i32 = match x.checked_add(*r) {
-                    Some(x) => x,
-                    None => continue
-                };
-
-                let top: i32 = match (screen_height as i64 - (*y as i64 + *r as i64)).try_into() {
-                    Ok(x) => x,
-                    Err(_) => continue
-                };
-
-                let bottom: i32 = match (screen_height as i64 - (*y as i64 - *r as i64)).try_into() {
-                    Ok(x) => x,
-                    Err(_) => continue
-                };
-
+            for (left_x, right_x, top_y, bottom_y, brush) in paint_objects.iter() {
                 SelectObject(mem_dc, *brush as _);
-                Ellipse(mem_dc, left, top, right, bottom);
+                Ellipse(mem_dc, *left_x, *top_y, *right_x, *bottom_y);
             }
 
             FrameRect(mem_dc, rc, p.border as _);
@@ -245,8 +224,12 @@ impl DrawingApp {
     }
 
     fn get_status_text(&self) -> Vec<String> {
+        let objects_len;
+        {
+            objects_len = self.engine.objects.lock().unwrap().len();  // get len early to avoid holding two locks at once
+        }
+
         let params = self.engine.params.lock().unwrap();
-        let objects = self.engine.objects.lock().unwrap();
 
         let method = match params.method {
             IntegrationMethod::Symplectic(k) => {
@@ -285,7 +268,7 @@ impl DrawingApp {
                     format!("({:.2} min/s)", params.time_step / 60.0)
                 } else { "".into() }
             ),
-            format!("Objects: {}", objects.len()),
+            format!("Objects: {}", objects_len),
             format!("Method: {}", method),
             format!("Threads: {}", params.num_threads),
             format!("Speed: {:.0} n/s", params.iteration_speed)
@@ -297,8 +280,7 @@ impl DrawingApp {
     fn get_object_description_text(&self) -> Vec<String> {
         let obj;
         let objects = self.engine.objects.lock().unwrap();
-        if let Some(target) = *self.current_target.borrow() {
-            
+        if let Some(target) = *self.current_target.borrow() {   
             if let Some(object) = objects.iter().find(|x| x.uuid == target) {
                 obj = object;
             } else {
@@ -308,12 +290,22 @@ impl DrawingApp {
             return vec![];
         }
 
+        let mut parent_info: Vec<String> = vec!["".into(), "".into(), "".into()];
+        if let Some(parent) = engine::Engine::find_orbital_parent(obj, &objects) {
+            parent_info = vec![
+                format!(" - {:.4e} m/s compared to {}", obj.velocity.substract(&parent.velocity).length(), parent.name),
+                format!(" - {:.4e} m/s^2 compared to {}", obj.acceleration.substract(&parent.acceleration).length(), parent.name),
+                format!(" - {:.4e} J compared to {}", 0.5 * obj.velocity.substract(&parent.velocity).length().powi(2) * obj.mass, parent.name),
+            ]
+        }
+
         vec![
             format!("Name: {}", obj.name),
             format!("Mass: {:.4e} kg", obj.mass),
             format!("Radius: {:.4e} m", obj.radius),
-            format!("Speed: {:.4e} m/s", obj.velocity.length()),
-            format!("Kinetic energy: {:.4e} J", 0.5 * obj.mass * obj.velocity.length().powi(2)),
+            format!("Speed: {:.4e} m/s{}", obj.velocity.length(), parent_info[0]),
+            format!("Acceleration magnitude: {:.4e} m/s^2{}", obj.acceleration.length(), parent_info[1]),
+            format!("Kinetic energy: {:.4e} J{}", 0.5 * obj.mass * obj.velocity.length().powi(2), parent_info[2]),
             "".into(),
             format!("Position: [{:.4e}, {:.4e}, {:.4e}]", obj.position.data[0], obj.position.data[1], obj.position.data[2]),
             format!("Velocity: [{:.4e}, {:.4e}, {:.4e}]", obj.velocity.data[0], obj.velocity.data[1], obj.velocity.data[2]),
@@ -321,15 +313,12 @@ impl DrawingApp {
         ]
     }
 
-    fn get_paint_objects(&self) -> Vec<(i32, i32, i32, HBRUSH)> {
+    fn get_paint_objects(&self) -> Vec<(i32, i32, i32, i32, HBRUSH)> {
         let bodies = self.engine.objects.lock().unwrap().clone();
         let mut camera = self.camera.lock().unwrap();
         let mut target_opt = self.current_target.borrow_mut();
 
         let (screen_width_pix, screen_height_pix) = self.window.size();
-        let w_128 = screen_width_pix as i128;
-        let h_128 = screen_height_pix as i128;
-
         let screen_scalar = screen_width_pix as f64 / 2.0 / (camera.fov / 2.0).to_radians().tan();
 
         if let Some(target) = *target_opt {
@@ -344,12 +333,11 @@ impl DrawingApp {
 
         let transform = camera.get_full_transformation();
 
-        let mut output: Vec<(i32, i32, i32, HBRUSH)> = Vec::new();
+        let mut output: Vec<(i32, i32, i32, i32, HBRUSH)> = Vec::new();
 
         let mut sorted_indices: Vec<usize> = (0..bodies.len()).collect();
         sorted_indices.sort_by(|a, b| bodies[*b].cmp(&bodies[*a], &camera.get_position().to_3d()));
 
-        // let mut targets_rc= self.targets.lock().unwrap();
         let mut targets = self.targets.borrow_mut();
         targets.clear();
 
@@ -363,46 +351,43 @@ impl DrawingApp {
 
             let distance_scalar = 1.0 - pos.data[2];
             
-            let center_x = pos.data[0] / distance_scalar * screen_scalar;
-            let center_y = pos.data[1] / distance_scalar * screen_scalar;
+            // Transfer to screen coordinates
+            let center_x = pos.data[0] / distance_scalar * screen_scalar + screen_width_pix as f64 / 2.0;
+            let center_y = screen_height_pix as f64 / 2.0 - pos.data[1] / distance_scalar * screen_scalar;
 
             let radius_without_mag = body.radius / camera.distance / distance_scalar * screen_scalar;
             let radius_with_mag = radius_without_mag * body.magnification.powf(1.0 / 3.0);
 
-            let res_x: i32 = match (center_x.round() as i128 + w_128 / 2).try_into() {
-                Ok(num) => num,
-                Err(_) => continue
-            };
+            let max_magnification = 14.0;
+            let mut radius = if radius_without_mag < max_magnification { radius_with_mag.min(max_magnification) } else { radius_without_mag };
+            radius = radius.max(3.0);
 
-            let res_y: i32 = match (center_y.round() as i128 + h_128 / 2).try_into() {
-                Ok(num) => num,
-                Err(_) => continue
-            };
+            let left_x = center_x - radius;
+            let right_x = center_x + radius;
 
-            let res_radius_without_mag: i32 = match (radius_without_mag.round() as u128).try_into() {
-                Ok(num) => num,
-                Err(_) => continue
-            };
+            let top_y = center_y - radius;
+            let bottom_y = center_y + radius;
 
-            let res_radius_with_mag: i32 = match (radius_with_mag.round() as u128).try_into() {
-                Ok(num) => num,
-                Err(_) => continue
-            };
+            let res_left_x: i32 = left_x.round() as i32;
+            let res_right_x: i32 = right_x.round() as i32;
+            let res_top_y: i32 = top_y.round() as i32;
+            let res_bottom_y: i32 = bottom_y.round() as i32;
 
-            let max_magnification = 14;
-            let mut res_radius = if res_radius_without_mag < max_magnification { res_radius_with_mag.min(max_magnification) } else { res_radius_without_mag };
-            res_radius = res_radius.max(3);
+            if res_right_x < 0 || res_bottom_y < 0 || res_left_x > screen_width_pix as i32 || res_top_y > screen_height_pix as i32 {
+                continue;
+            }
 
             let [r, g, b] = body.color;
             output.push(
                 (
-                    res_x,
-                    res_y,
-                    res_radius,
+                    res_left_x,
+                    res_right_x,
+                    res_top_y,
+                    res_bottom_y,
                     self.get_brush(r, g, b)
                 )
             );
-            targets.push(TargetData { uuid: body.uuid, x: res_x, y: res_y, radius: res_radius });
+            targets.push(TargetData { uuid: body.uuid, x: center_x, y: center_y, radius });
         }
 
         output
@@ -462,6 +447,14 @@ fn main() {
 
     *app_ui.engine.framerate.lock().unwrap() = FRAMERATE;
     app_ui.engine.params.lock().unwrap().target_speed = 86400.0 * 1.0;
+
+    // for _ in 0..2000 {
+    //     let mut objects = app_ui.engine.objects.lock().unwrap();
+    //     let orbital = AstronomicalObject::get_random_planet();
+    //     let object = AstronomicalObject::place_on_orbit(orbital, &objects[0]);
+
+    //     objects.push(object);
+    // }
     
     app_ui.animation_timer.start();        
     nwg::dispatch_thread_events();

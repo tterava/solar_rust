@@ -73,6 +73,19 @@ impl Vector3d {
         let squares = (0..3).fold(0.0, |acc, i| acc + self.data[i].powi(2));
         squares.sqrt()
     }
+
+    pub fn length_squared(&self) -> f64 {
+        (0..3).fold(0.0, |acc, i| acc + self.data[i].powi(2))
+    }
+
+    pub fn get_unit_vector(&self) -> Vector3d {
+        let length = self.length();
+        self.multiply(1.0 / length)
+    }
+
+    pub fn dot_product(&self, other: &Vector3d) -> f64 {
+        (0..3).fold(0.0f64, |acc, x| acc + self.data[x] * other.data[x])
+    }
 }
 
 impl Vector4d {

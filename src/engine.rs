@@ -4,7 +4,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::astronomy::AstronomicalObject;
-use crate::integration::{self, IntegrationMethod};
+use crate::integration::{self, IntegrationMethod, G};
 use crate::vector::Vector3d;
 
 type WorkResult = Result<Vec<Vector3d>, (usize, usize)>;
@@ -43,7 +43,9 @@ pub struct Engine {
 impl Engine {
     pub fn start_mt(&self) {
         let mut stopped = self.thread_stopped.lock().unwrap();
-        if !*stopped {
+        let objects_local = Arc::new(RwLock::new(self.objects.lock().unwrap().clone()));
+
+        if !*stopped || objects_local.read().unwrap().len() < 2 {
             return;
         }
 
@@ -54,17 +56,16 @@ impl Engine {
             params.is_running = true;
         }
 
-        let objects_local = Arc::new(RwLock::new(self.objects.lock().unwrap().clone()));
         let objects_shared = self.objects.clone();
         let params_lock = self.params.clone();
         let stopped_lock = self.thread_stopped.clone();
 
-        let framerate = *self.framerate.lock().unwrap();
+        let framerate = *self.framerate.lock().unwrap() as f64;
 
         thread::spawn(move || {
             let mut method;
             let mut num_threads;
-            let mut time_step; 
+            let mut time_step;
 
             {
                 let params = params_lock.lock().unwrap();
@@ -80,7 +81,7 @@ impl Engine {
 
             let mut i = 0;
             let mut steps_until_update = 1000u128;
-            
+
             let mut use_symplectic = match method {
                 IntegrationMethod::Symplectic(_) => true,
                 IntegrationMethod::RK4 => false,
@@ -101,17 +102,14 @@ impl Engine {
                     let mut objects_local = objects_local.write().unwrap();
                     if use_symplectic {
                         let coefficient_table = method.get_coefficients();
-
-                        while i < steps_until_update {
+                        'outer_integration_loop: while i < steps_until_update {
                             for (c, d) in coefficient_table.iter() {
-                                if *c != 0.0 {
-                                    objects_local.iter_mut().for_each(|x| {
-                                        _ = x.position.add_mut(&x.velocity.multiply(time_step * c))
-                                    });
-                                }
+                                objects_local.iter_mut().for_each(|x| {
+                                    x.position.add_mut(&x.velocity.multiply(time_step * c));
+                                });
 
+                                // Checking for d speeds up 4th order symplectic integration significantly
                                 if *d != 0.0 {
-                                    // This will speed up 4th order Simplectic integration
                                     loop {
                                         let num_objects = objects_local.len();
                                         match integration::symplectic(
@@ -135,6 +133,11 @@ impl Engine {
                                                     &mut objects_local,
                                                     &indices,
                                                 );
+
+                                                if objects_local.len() < 2 {
+                                                    params_lock.lock().unwrap().is_running = false;
+                                                    break 'outer_integration_loop;
+                                                }
                                             }
                                         }
                                     }
@@ -150,7 +153,11 @@ impl Engine {
                             match integration::runge_kutta_4(&mut objects_local, time_step) {
                                 Ok(_) => {}
                                 Err(indices) => {
-                                    integration::collide_objects(&mut objects_local, &indices)
+                                    integration::collide_objects(&mut objects_local, &indices);
+                                    if objects_local.len() < 2 {
+                                        params_lock.lock().unwrap().is_running = false;
+                                        break;
+                                    }
                                 }
                             }
 
@@ -159,12 +166,12 @@ impl Engine {
                     }
                 } else {
                     let coefficient_table = method.get_coefficients();
-                    while i < steps_until_update {
+                    'outer_integration_loop: while i < steps_until_update {
                         for (c, d) in coefficient_table.iter() {
                             if *c != 0.0 {
                                 let mut objects = objects_local.write().unwrap();
                                 objects.iter_mut().for_each(|x| {
-                                    _ = x.position.add_mut(&x.velocity.multiply(time_step * c))
+                                    x.position.add_mut(&x.velocity.multiply(time_step * c));
                                 });
                             }
 
@@ -197,6 +204,11 @@ impl Engine {
                                                     collision,
                                                 );
 
+                                                if objects.len() < 2 {
+                                                    params_lock.lock().unwrap().is_running = false;
+                                                    break 'outer_integration_loop;
+                                                }
+
                                                 let mut work_queue =
                                                     state.work_queue.write().unwrap();
 
@@ -226,7 +238,44 @@ impl Engine {
                     }
                 }
 
+                {
+                    // Update state for UI
+                    let objects = objects_local.read().unwrap();
+                    let mut objects_shared = objects_shared.lock().unwrap();
+                    objects_shared.clear();
+                    objects.iter().for_each(|o| objects_shared.push(o.clone()));
+                }
+
                 let mut params = params_lock.lock().unwrap();
+
+                let new_time = Instant::now();
+                let duration = (new_time - time_now).as_nanos();
+
+                let speed: f64 = if duration == 0 {
+                    // This should double steps for next iteration until Duration can be measured
+                    steps_until_update as f64 * 2.0 * framerate
+                } else {
+                    // n/s
+                    steps_until_update as f64 * 1_000_000_000.0 / duration as f64
+                };
+
+                steps_until_update = (speed / framerate).round() as u128;
+
+                // Limit next update to have at least 10 steps
+                steps_until_update = steps_until_update.max(10);
+
+                if params.use_target_speed {
+                    let target_speed = params.target_speed;
+                    time_step = target_speed / speed;
+                    params.time_step = time_step;
+                } else {
+                    time_step = params.time_step;
+                    let target_speed = time_step * speed;
+                    params.target_speed = target_speed;
+                }
+
+                params.iteration_speed = speed;
+                time_now = new_time;
 
                 if !params.is_running
                     || num_threads != params.num_threads
@@ -265,35 +314,6 @@ impl Engine {
                     }
                 }
 
-                let new_time = Instant::now();
-                let duration = (new_time - time_now).as_secs_f64();
-
-                let speed = if duration == 0.0 {
-                    2000.0
-                } else {
-                    steps_until_update as f64 / duration
-                };
-
-                steps_until_update = (speed / framerate as f64).round() as u128;
-
-                if params.use_target_speed {
-                    let target_speed = params.target_speed;
-                    time_step = target_speed / speed;
-                    params.time_step = time_step;
-                } else {
-                    time_step = params.time_step;
-                    let target_speed = time_step * speed;
-                    params.target_speed = target_speed;
-                }
-
-                params.iteration_speed = speed;
-                time_now = new_time;
-
-                let objects = objects_local.read().unwrap();
-                let mut objects_shared = objects_shared.lock().unwrap();
-                objects_shared.clear();
-                objects.iter().for_each(|o| objects_shared.push(o.clone()));
-
                 i = 0;
             }
         });
@@ -316,10 +336,12 @@ impl Engine {
         }
 
         let len = combinations.len();
+        let max_threads = len.min(num_threads);
+
         let mut buckets = Vec::new();
-        for i in 0..num_threads {
-            let mut num = if i < len % num_threads { 1 } else { 0 };
-            num += len / num_threads;
+        for i in 0..max_threads {
+            let mut num = if i < len % max_threads { 1 } else { 0 };
+            num += len / max_threads;
 
             let bucket = combinations.split_off(combinations.len() - num);
             let (a, b) = bucket.first().unwrap();
@@ -377,12 +399,17 @@ impl Engine {
                     if kill_lock.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
+                    {
+                        let work_item_queue = work_queue_lock.read().unwrap();
+                        if work_item_queue.len() > i_thread {
+                            let work_item = &work_queue_lock.read().unwrap()[i_thread];
+                            let objects = objects_lock.read().unwrap();
 
-                    let work_item = &work_queue_lock.read().unwrap()[i_thread];
-                    let objects = objects_lock.read().unwrap();
-
-                    let mut result = result_lock.lock().unwrap();
-                    *result = integration::symplectic(&objects, work_item.start, work_item.end);
+                            let mut result = result_lock.lock().unwrap();
+                            *result =
+                                integration::symplectic(&objects, work_item.start, work_item.end);
+                        }
+                    }
 
                     barrier_lock.wait(); // Important to have two barrier waits. Main thread prepares work between
                 }
@@ -392,6 +419,40 @@ impl Engine {
         }
 
         handles
+    }
+
+    pub fn find_orbital_parent<'a>(
+        child: &'a AstronomicalObject,
+        objects: &'a [AstronomicalObject],
+    ) -> Option<&'a AstronomicalObject> {
+        let allowed_error = 0.1f64;
+        if child.acceleration.length() == 0.0 {
+            return None;
+        }
+
+        let child_acc_unit = child.acceleration.get_unit_vector();
+
+        for other in objects {
+            if std::ptr::eq(child, other) {
+                continue;
+            }
+
+            let difference = other.position.substract(&child.position);
+            let scalar = difference.dot_product(&child_acc_unit);
+
+            if 1.0 - scalar / difference.length() >= allowed_error {
+                continue;
+            }
+
+            let acc_caused_by_other = G * other.mass / difference.length_squared();
+            if 1.0 - acc_caused_by_other / child.acceleration.length() >= allowed_error {
+                continue;
+            }
+
+            return Some(other);
+        }
+
+        None
     }
 }
 

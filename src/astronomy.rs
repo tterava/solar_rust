@@ -217,7 +217,7 @@ impl AstronomicalObject {
             system.iter().find(|x| x.name == "Mars").unwrap(),
         ));
 
-        // // Never 4get
+        // Never 4get
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
                 name: "Pluto".to_string(),
@@ -249,12 +249,25 @@ impl AstronomicalObject {
         // system.push(AstronomicalObject {
         //     name: "Neutron star".into(),
         //     mass: 1.4 * SOLAR_MASS,
-        //     position: Vector3d { data: [-1.3 * AU, 0.0, 50.0 * AU] },
+        //     position: Vector3d { data: [-0.7 * AU, 0.9 * AU, 50.0 * AU] },
         //     velocity: Vector3d { data: [0.0, 0.0, -32000.0] },
         //     acceleration: Vector3d::default(),
         //     radius: 10000.0,
         //     magnification: 1.0E7,
         //     color: [255, 255, 255],
+        //     uuid: Uuid::new_v4()
+        // });
+
+        // system.push(AstronomicalObject {
+        //     name: "Monster star".into(),
+        //     mass: 25.4 * SOLAR_MASS,
+        //     position: Vector3d { data: [-0.7 * AU, 0.9 * AU, 50.0 * AU] },
+        //     velocity: Vector3d { data: [0.0, 0.0, -32000.0] },
+        //     acceleration: Vector3d::default(),
+        //     radius: 20.0 * 695700.0E3,
+        //     magnification: 10.0,
+        //     color: [255, 255, 255],
+        //     uuid: Uuid::new_v4()
         // });
 
         // system.push(AstronomicalObject::place_on_orbit(

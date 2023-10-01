@@ -17,9 +17,8 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
             E::OnMousePress(M::MousePressLeftDown) => {
                 let (w_x, w_y) = app.window.position();               
                 let (m_x, m_y) = winput::Mouse::position().unwrap();
-                let (_, size_y) = app.canvas.size();
 
-                let (x, y) = (m_x - w_x - 8, size_y as i32 - (m_y - w_y - 31));  // Offset x: 8, y: 31 works for Windows 11. TODO: Figure a better way for this
+                let (x, y) = (m_x - w_x - 8, m_y - w_y - 31);  // Offset x: 8, y: 31 works for Windows 11. TODO: Figure a better way for this
                 let targets = app.targets.borrow();
 
                 println!("{}, {}", m_x - w_x, m_y - w_y);
@@ -74,6 +73,18 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
                             let mut params = app.engine.params.lock().unwrap();
 
                             params.num_threads = threads as usize;
+                            *app.next_status_update.borrow_mut() = Instant::now();
+                        },
+                        81 => {
+                            let mut params = app.engine.params.lock().unwrap();
+   
+                            params.num_threads = (params.num_threads - 1).max(1);
+                            *app.next_status_update.borrow_mut() = Instant::now();
+                        },
+                        87 => {
+                            let mut params = app.engine.params.lock().unwrap();
+   
+                            params.num_threads += 1;
                             *app.next_status_update.borrow_mut() = Instant::now();
                         },
                         77 => {

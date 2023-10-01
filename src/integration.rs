@@ -187,6 +187,7 @@ pub fn collide_objects(
             .multiply(obs[l].mass / total_mass),
     );
 
+    obs[h].mass += obs[l].mass;
     obs[h].radius *= (total_mass / obs[h].mass).powf(1.0 / 3.0);
 
     println!("{} collided into {}!", obs[l].name, obs[h].name);
