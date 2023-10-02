@@ -111,12 +111,7 @@ impl Engine {
                                 // Checking for d speeds up 4th order symplectic integration significantly
                                 if *d != 0.0 {
                                     loop {
-                                        let num_objects = objects_local.len();
-                                        match integration::symplectic(
-                                            &objects_local,
-                                            (0, 0),
-                                            (num_objects - 2, num_objects - 1), // Inclusive range
-                                        ) {
+                                        match integration::symplectic(&objects_local) {
                                             Ok(res) => {
                                                 for (body, vector) in
                                                     objects_local.iter_mut().zip(res)
@@ -406,8 +401,11 @@ impl Engine {
                             let objects = objects_lock.read().unwrap();
 
                             let mut result = result_lock.lock().unwrap();
-                            *result =
-                                integration::symplectic(&objects, work_item.start, work_item.end);
+                            *result = integration::symplectic_mt(
+                                &objects,
+                                work_item.start,
+                                work_item.end,
+                            );
                         }
                     }
 

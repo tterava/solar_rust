@@ -22,18 +22,18 @@ impl IntegrationMethod {
                 ],
                 4 => vec![
                     (
-                        1.0 / 2.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                        1.0 / (4.0 - 2.0f64.powf(4.0 / 3.0)),
                         1.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
                     ),
                     (
-                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / 2.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
                         -(2.0f64.powf(1.0 / 3.0) / (2.0 - 2.0f64.powf(1.0 / 3.0))),
                     ),
                     (
-                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / 2.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
                         1.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
                     ),
-                    (1.0 / 2.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)), 0.0),
+                    (1.0 / (4.0 - 2.0f64.powf(4.0 / 3.0)), 0.0),
                 ],
                 _ => vec![],
             },
@@ -52,13 +52,18 @@ pub fn runge_kutta_4(
     local_bodies: &mut Vec<AstronomicalObject>,
     time_step: f64,
 ) -> Result<(), (usize, usize)> {
-    let mut dt = 0.0f64;
+    let mut dt = 0.5f64 * time_step;
     let num_bodies = local_bodies.len();
 
-    let mut s: [Vec<IntermediateState>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut s: [Vec<IntermediateState>; 4] = [
+        Vec::with_capacity(num_bodies),
+        Vec::with_capacity(num_bodies),
+        Vec::with_capacity(num_bodies),
+        Vec::with_capacity(num_bodies),
+    ];
 
     for state in 0..4 {
-        if state == 1 || state == 3 {
+        if state == 3 {
             dt += 0.5 * time_step;
         }
 
@@ -86,8 +91,10 @@ pub fn runge_kutta_4(
             }
         }
 
-        s[state] = (0..num_bodies)
-            .map(|i| IntermediateState {
+        s[state] = dv
+            .into_iter()
+            .enumerate()
+            .map(|(i, accel)| IntermediateState {
                 velocity: if state == 0 {
                     local_bodies[i].velocity.clone()
                 } else {
@@ -95,7 +102,7 @@ pub fn runge_kutta_4(
                         .velocity
                         .add(&s[state - 1][i].dv.multiply(dt))
                 },
-                dv: dv[i].clone(),
+                dv: accel,
             })
             .collect();
     }
@@ -113,15 +120,16 @@ pub fn runge_kutta_4(
 
         dvdt.add_mut(&s[3][i].dv).multiply_mut(1.0 / 6.0);
 
-        body.velocity.add_mut(dvdt.multiply_mut(time_step));
+        body.velocity.add_mut(&dvdt.multiply(time_step));
         body.position.add_mut(dxdt.multiply_mut(time_step));
+        body.acceleration = dvdt;
     }
 
     Ok(())
 }
 
 // https://en.wikipedia.org/wiki/Symplectic_integrator
-pub fn symplectic(
+pub fn symplectic_mt(
     local_bodies: &Vec<AstronomicalObject>,
     start: (usize, usize),
     end: (usize, usize),
@@ -144,6 +152,30 @@ pub fn symplectic(
                 break 'outer_loop;
             }
 
+            let (a, b) = (&local_bodies[first], &local_bodies[second]);
+
+            let difference = b.position.substract(&a.position);
+            let distance = difference.length();
+
+            if distance <= a.radius + b.radius {
+                return Err((first, second)); // Process collisions before update results
+            }
+            let grav_mult = G / (distance.powi(3)); // Divide by r^3 to get a unit vector out of difference
+
+            acceleration_vectors[first].add_mut(&difference.multiply(grav_mult * b.mass));
+            acceleration_vectors[second].add_mut(&difference.multiply(-grav_mult * a.mass));
+        }
+    }
+
+    Ok(acceleration_vectors)
+}
+
+pub fn symplectic(local_bodies: &Vec<AstronomicalObject>) -> Result<Vec<Vector3d>, (usize, usize)> {
+    let num_bodies = local_bodies.len();
+    let mut acceleration_vectors = vec![Vector3d::default(); num_bodies];
+
+    for first in 0..local_bodies.len() - 1 {
+        for second in first + 1..local_bodies.len() {
             let (a, b) = (&local_bodies[first], &local_bodies[second]);
 
             let difference = b.position.substract(&a.position);

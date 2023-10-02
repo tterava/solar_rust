@@ -32,7 +32,7 @@ use std::sync::{Mutex, Arc};
 use winapi::shared::windef::{HBRUSH, HPEN, HFONT};
 use winapi::um::wingdi::{CreateSolidBrush, CreatePen, Ellipse, SelectObject, RGB, PS_SOLID, CreateFontW, FW_NORMAL, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, FF_DONTCARE, TextOutW, SetBkMode, TRANSPARENT, SetTextColor, FW_BOLD, CreateCompatibleDC, CreateCompatibleBitmap, BitBlt, SRCCOPY, DeleteObject, DeleteDC};
 
-const FRAMERATE: u32 = 170;
+const FRAMERATE: u32 = 100;
 
 pub struct PaintData {
     background: HBRUSH,
@@ -358,7 +358,7 @@ impl DrawingApp {
             let radius_without_mag = body.radius / camera.distance / distance_scalar * screen_scalar;
             let radius_with_mag = radius_without_mag * body.magnification.powf(1.0 / 3.0);
 
-            let max_magnification = 14.0;
+            let max_magnification = 10.0;
             let mut radius = if radius_without_mag < max_magnification { radius_with_mag.min(max_magnification) } else { radius_without_mag };
             radius = radius.max(3.0);
 
@@ -448,7 +448,7 @@ fn main() {
     *app_ui.engine.framerate.lock().unwrap() = FRAMERATE;
     app_ui.engine.params.lock().unwrap().target_speed = 86400.0 * 1.0;
 
-    // for _ in 0..2000 {
+    // for _ in 0..500 {
     //     let mut objects = app_ui.engine.objects.lock().unwrap();
     //     let orbital = AstronomicalObject::get_random_planet();
     //     let object = AstronomicalObject::place_on_orbit(orbital, &objects[0]);

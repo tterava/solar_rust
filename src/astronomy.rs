@@ -234,7 +234,7 @@ impl AstronomicalObject {
 
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
-                name: "Internation Space Station".to_string(),
+                name: "International Space Station".to_string(),
                 mass: 450.0E3,
                 radius: 100.0,
                 positive_y_rotation: true,
