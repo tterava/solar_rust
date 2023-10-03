@@ -2,9 +2,8 @@ use std::cmp::Ordering;
 use std::f64::consts::PI;
 
 use crate::integration::G;
-use crate::matrix::Matrix4d;
-use crate::vector::{Vector3d, Vector4d};
 
+use glam::{DAffine3, DVec3};
 use rand::Rng;
 use uuid::Uuid;
 
@@ -36,13 +35,13 @@ pub struct OrbitalObject {
 pub struct AstronomicalObject {
     pub name: String,
     pub mass: f64,
-    pub position: Vector3d,
-    pub velocity: Vector3d,
-    pub acceleration: Vector3d,
+    pub position: DVec3,
+    pub velocity: DVec3,
+    pub acceleration: DVec3,
     pub radius: f64,
     pub magnification: f64,
     pub color: [u8; 3],
-    pub uuid: Uuid
+    pub uuid: Uuid,
 }
 
 impl AstronomicalObject {
@@ -50,13 +49,13 @@ impl AstronomicalObject {
         let mut system = vec![AstronomicalObject {
             name: "Sun".to_string(),
             mass: SOLAR_MASS,
-            position: Vector3d::default(),
-            velocity: Vector3d::default(),
-            acceleration: Vector3d::default(),
+            position: DVec3::ZERO,
+            velocity: DVec3::ZERO,
+            acceleration: DVec3::ZERO,
             radius: 695700.0E3,
             magnification: 100.0,
             color: [255, 255, 0],
-            uuid: Uuid::new_v4()
+            uuid: Uuid::new_v4(),
         }];
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -287,7 +286,7 @@ impl AstronomicalObject {
         system
     }
 
-    pub fn cmp(&self, other: &AstronomicalObject, target: &Vector3d) -> Ordering {
+    pub fn cmp(&self, other: &AstronomicalObject, target: DVec3) -> Ordering {
         let a = self.position.distance_squared(target);
         let b = other.position.distance_squared(target);
 
@@ -319,40 +318,33 @@ impl AstronomicalObject {
             speed *= -1.0;
         }
 
-        let mut position = Vector4d {
-            data: [0.0, 0.0, radius, 1.0],
-        };
-        let mut velocity = Vector4d {
-            data: [speed, 0.0, 0.0, 1.0],
-        };
-
         let inclination_angle = match obj.inclination {
             Inclination::Fixed(a) => a,
             Inclination::Random(a) => rng.gen_range(0.0..=a),
         };
 
-        let rot_y = Matrix4d::rot_y(rng.gen_range(0.0..2.0 * PI));
-        let rot_z = Matrix4d::rot_z(inclination_angle);
-        let rot_y_2 = Matrix4d::rot_y(rng.gen_range(0.0..2.0 * PI));
-        let translate_pos = Matrix4d::trans(&target.position.to_4d().multiply(-1.0));
-        let translate_vel = Matrix4d::trans(&target.velocity.to_4d().multiply(-1.0));
+        let rot_y = DAffine3::from_rotation_y(rng.gen_range(0.0..2.0 * PI));
+        let rot_z = DAffine3::from_rotation_z(inclination_angle);
+        let rot_y_2 = DAffine3::from_rotation_y(rng.gen_range(0.0..2.0 * PI));
+        let translate_pos = DAffine3::from_translation(target.position);
+        let translate_vel = DAffine3::from_translation(target.velocity);
 
-        let matrix_pos = translate_pos * rot_y_2 * rot_z * rot_y;
-        let matrix_vel = translate_vel * rot_y_2 * rot_z * rot_y;
+        let transform_pos = translate_pos * rot_y_2 * rot_z * rot_y;
+        let transform_vel = translate_vel * rot_y_2 * rot_z * rot_y;
 
-        velocity = matrix_vel * &velocity;
-        position = matrix_pos * &position;
+        let position = transform_pos.transform_point3(DVec3::new(0.0, 0.0, radius));
+        let velocity = transform_vel.transform_point3(DVec3::new(speed, 0.0, 0.0));
 
         AstronomicalObject {
             name: obj.name,
             mass: obj.mass,
-            position: position.to_3d(),
-            velocity: velocity.to_3d(),
-            acceleration: Vector3d::default(),
+            position,
+            velocity,
+            acceleration: DVec3::ZERO,
             radius: obj.radius,
             magnification: obj.magnification,
             color: obj.color,
-            uuid: Uuid::new_v4()
+            uuid: Uuid::new_v4(),
         }
     }
 
@@ -361,7 +353,7 @@ impl AstronomicalObject {
 
         let density_earth = 5.972168E24 / 6371.0E3f64.powi(3);
         let mass = rng.gen_range(1.303E22..=6.8982E27);
-        let radius = (mass / density_earth).powf(1.0 / 3.0);
+        let radius = (mass / density_earth).powf(3.0_f64.recip());
 
         OrbitalObject {
             name: rng.gen_range(0..=1000000).to_string(),

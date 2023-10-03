@@ -3,11 +3,12 @@ use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use glam::DVec3;
+
 use crate::astronomy::AstronomicalObject;
 use crate::integration::{self, IntegrationMethod, G};
-use crate::vector::Vector3d;
 
-type WorkResult = Result<Vec<Vector3d>, (usize, usize)>;
+type WorkResult = Result<Vec<DVec3>, (usize, usize)>;
 
 struct WorkItem {
     start: (usize, usize),
@@ -105,10 +106,10 @@ impl Engine {
                         'outer_integration_loop: while i < steps_until_update {
                             for (c, d) in coefficient_table.iter() {
                                 objects_local.iter_mut().for_each(|x| {
-                                    x.position.add_mut(&x.velocity.multiply(time_step * c));
+                                    x.position += time_step * c * x.velocity;
                                 });
 
-                                // Checking for d speeds up 4th order symplectic integration significantly
+                                // This check speeds up 4th order symplectic integration significantly
                                 if *d != 0.0 {
                                     loop {
                                         match integration::symplectic(&objects_local) {
@@ -116,8 +117,7 @@ impl Engine {
                                                 for (body, vector) in
                                                     objects_local.iter_mut().zip(res)
                                                 {
-                                                    body.velocity
-                                                        .add_mut(&vector.multiply(time_step * d));
+                                                    body.velocity += time_step * d * vector;
                                                     body.acceleration = vector;
                                                 }
 
@@ -166,7 +166,7 @@ impl Engine {
                             if *c != 0.0 {
                                 let mut objects = objects_local.write().unwrap();
                                 objects.iter_mut().for_each(|x| {
-                                    x.position.add_mut(&x.velocity.multiply(time_step * c));
+                                    x.position += time_step * c * x.velocity;
                                 });
                             }
 
@@ -179,8 +179,7 @@ impl Engine {
                                     let mut objects = objects_local.write().unwrap();
 
                                     // These will hold the final acceleration values
-                                    let mut acceleration_vectors =
-                                        vec![Vector3d::default(); objects.len()];
+                                    let mut acceleration_vectors = vec![DVec3::ZERO; objects.len()];
 
                                     for lock in results {
                                         let result = lock.lock().unwrap();
@@ -190,7 +189,7 @@ impl Engine {
                                                 for (acc, res) in
                                                     acceleration_vectors.iter_mut().zip(vectors)
                                                 {
-                                                    acc.add_mut(res);
+                                                    *acc += *res;
                                                 }
                                             }
                                             Err(collision) => {
@@ -221,7 +220,7 @@ impl Engine {
                                     for (object, acc) in
                                         objects.iter_mut().zip(acceleration_vectors)
                                     {
-                                        object.velocity.add_mut(&acc.multiply(time_step * d));
+                                        object.velocity += time_step * d * acc;
                                         object.acceleration = acc;
                                     }
 
@@ -428,15 +427,15 @@ impl Engine {
             return None;
         }
 
-        let child_acc_unit = child.acceleration.get_unit_vector();
+        let child_acc_unit = child.acceleration.clamp_length(1.0, 1.0);
 
         for other in objects {
             if std::ptr::eq(child, other) {
                 continue;
             }
 
-            let difference = other.position.substract(&child.position);
-            let scalar = difference.dot_product(&child_acc_unit);
+            let difference = other.position - child.position;
+            let scalar = difference.dot(child_acc_unit);
 
             if 1.0 - scalar / difference.length() >= allowed_error {
                 continue;

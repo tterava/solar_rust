@@ -1,8 +1,8 @@
 use std::f64::consts::PI;
 
+use glam::{DAffine3, DVec3};
+
 use crate::astronomy::AU;
-use crate::matrix::Matrix4d;
-use crate::vector::Vector4d;
 
 // For drawing camera is assumed to be situated on the positive side of the Z-axis at (0,0,1), with target being origin.
 // Matrix operations are used to transform the simulation space into camera space.
@@ -10,7 +10,7 @@ use crate::vector::Vector4d;
 
 #[derive(Debug)]
 pub struct Camera {
-    pub target: Vector4d,
+    pub target: DVec3,
     pub distance: f64,
     yaw: f64,
     pitch: f64,
@@ -31,17 +31,17 @@ impl Camera {
     }
     pub fn set_yaw(&mut self, angle: f64) {
         self.yaw = angle % (2.0 * PI);
-    }   
+    }
 
-    pub fn get_full_transformation(&self) -> Matrix4d {
-        let translation = Matrix4d::trans(&self.target);
+    pub fn get_full_transformation(&self) -> DAffine3 {
+        let translation = DAffine3::from_translation(-self.target);
 
-        let rot_y = Matrix4d::rot_y(-self.yaw);
-        let rot_x = Matrix4d::rot_x(-self.pitch);
+        let rot_y = DAffine3::from_rotation_y(-self.yaw);
+        let rot_x = DAffine3::from_rotation_x(-self.pitch);
 
-        let scale_matrix = Matrix4d::scale(1.0 / self.distance);
+        let scale = DAffine3::from_scale(DVec3::ONE / self.distance);
 
-        scale_matrix * rot_x * rot_y * translation
+        scale * rot_x * rot_y * translation
     }
 
     pub fn zoom(&mut self, amount: i32) {
@@ -51,23 +51,25 @@ impl Camera {
         };
     }
 
-    pub fn get_position(&self) -> Vector4d {
-        let transform = Matrix4d::scale(self.distance) * Matrix4d::rot_y(self.yaw) * Matrix4d::rot_x(self.pitch);
-        let unit_vec = Vector4d { data: [0.0, 0.0, 1.0, 1.0] };
-        let direction_vec = transform * &unit_vec;
+    pub fn get_position(&self) -> DVec3 {
+        let scale = DAffine3::from_scale(DVec3::ONE * self.distance);
+        let rot_y = DAffine3::from_rotation_y(self.yaw);
+        let rot_x = DAffine3::from_rotation_x(self.pitch);
 
-        self.target.add(&direction_vec)
+        let direction_vec = (scale * rot_y * rot_x).transform_point3(DVec3::new(0.0, 0.0, 1.0));
+
+        self.target + direction_vec
     }
 }
 
 impl Default for Camera {
     fn default() -> Camera {
         Camera {
-            target: Vector4d { data: [0.0, 0.0, 0.0, 1.0] },
+            target: DVec3::ZERO,
             distance: 2.0 * AU,
             yaw: 0.0,
             pitch: 0.0,
-            fov: 75.0
+            fov: 75.0,
         }
     }
 }

@@ -1,4 +1,8 @@
-use crate::{astronomy::AstronomicalObject, vector::Vector3d};
+use std::ops::DivAssign;
+
+use glam::DVec3;
+
+use crate::astronomy::AstronomicalObject;
 
 pub const G: f64 = 6.6743E-11;
 
@@ -16,24 +20,24 @@ impl IntegrationMethod {
                 1 => vec![(1.0, 1.0)],
                 2 => vec![(0.0, 0.5), (1.0, 0.5)],
                 3 => vec![
-                    (1.0, -1.0 / 24.0),
+                    (1.0, (-24.0_f64).recip()),
                     (-2.0 / 3.0, 3.0 / 4.0),
                     (2.0 / 3.0, 7.0 / 24.0),
                 ],
                 4 => vec![
                     (
-                        1.0 / (4.0 - 2.0f64.powf(4.0 / 3.0)),
-                        1.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                        (4.0 - 2.0f64.powf(4.0 / 3.0)).recip(),
+                        (2.0 - 2.0f64.powf(3.0_f64.recip())).recip(),
                     ),
                     (
-                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
-                        -(2.0f64.powf(1.0 / 3.0) / (2.0 - 2.0f64.powf(1.0 / 3.0))),
+                        (1.0 - 2.0f64.powf(3.0_f64.recip())) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
+                        -(2.0f64.powf(3.0_f64.recip()) / (2.0 - 2.0f64.powf(3.0_f64.recip()))),
                     ),
                     (
-                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
-                        1.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
+                        (1.0 - 2.0f64.powf(3.0_f64.recip())) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
+                        (2.0 - 2.0f64.powf(3.0_f64.recip())).recip(),
                     ),
-                    (1.0 / (4.0 - 2.0f64.powf(4.0 / 3.0)), 0.0),
+                    ((4.0 - 2.0f64.powf(4.0 / 3.0)).recip(), 0.0),
                 ],
                 _ => vec![],
             },
@@ -44,8 +48,8 @@ impl IntegrationMethod {
 
 #[derive(Default)]
 struct IntermediateState {
-    velocity: Vector3d,
-    dv: Vector3d,
+    velocity: DVec3,
+    dv: DVec3,
 }
 
 pub fn runge_kutta_4(
@@ -67,18 +71,18 @@ pub fn runge_kutta_4(
             dt += 0.5 * time_step;
         }
 
-        let mut positions: Vec<_> = local_bodies.iter().map(|x| x.position.clone()).collect();
-        let mut dv = vec![Vector3d::default(); num_bodies];
+        let mut positions: Vec<_> = local_bodies.iter().map(|x| x.position).collect();
+        let mut dv = vec![DVec3::ZERO; num_bodies];
 
         if state >= 1 {
             for (position, prev_state) in positions.iter_mut().zip(&s[state - 1]) {
-                position.add_mut(&prev_state.velocity.multiply(dt));
+                *position += prev_state.velocity * dt;
             }
         }
 
         for i in 0..num_bodies - 1 {
             for j in i + 1..num_bodies {
-                let difference = positions[j].substract(&positions[i]);
+                let difference = positions[j] - positions[i];
                 let distance = difference.length();
 
                 if state == 0 && distance <= local_bodies[i].radius + local_bodies[j].radius {
@@ -86,8 +90,8 @@ pub fn runge_kutta_4(
                 }
                 let grav_modifier = G / (difference.length().powi(3));
 
-                dv[i].add_mut(&difference.multiply(grav_modifier * local_bodies[j].mass));
-                dv[j].add_mut(&difference.multiply(-grav_modifier * local_bodies[i].mass));
+                dv[i] += grav_modifier * local_bodies[j].mass * difference;
+                dv[j] += -grav_modifier * local_bodies[i].mass * difference;
             }
         }
 
@@ -96,11 +100,9 @@ pub fn runge_kutta_4(
             .enumerate()
             .map(|(i, accel)| IntermediateState {
                 velocity: if state == 0 {
-                    local_bodies[i].velocity.clone()
+                    local_bodies[i].velocity
                 } else {
-                    local_bodies[i]
-                        .velocity
-                        .add(&s[state - 1][i].dv.multiply(dt))
+                    local_bodies[i].velocity + s[state - 1][i].dv * dt
                 },
                 dv: accel,
             })
@@ -108,20 +110,17 @@ pub fn runge_kutta_4(
     }
 
     for (i, body) in local_bodies.iter_mut().enumerate() {
-        let mut dxdt = s[0][i]
-            .velocity
-            .add(s[1][i].velocity.add(&s[2][i].velocity).multiply_mut(2.0));
+        let mut dxdt =
+            s[0][i].velocity + (s[1][i].velocity + s[2][i].velocity) * 2.0 + s[3][i].velocity;
 
-        dxdt.add_mut(&s[3][i].velocity).multiply_mut(1.0 / 6.0);
+        dxdt.div_assign(6.0);
 
-        let mut dvdt = s[0][i]
-            .dv
-            .add(s[1][i].dv.add(&s[2][i].dv).multiply_mut(2.0));
+        let mut dvdt = s[0][i].dv + (s[1][i].dv + s[2][i].dv) * 2.0 + s[3][i].dv;
+        dvdt.div_assign(6.0);
 
-        dvdt.add_mut(&s[3][i].dv).multiply_mut(1.0 / 6.0);
+        body.position += dxdt * time_step;
+        body.velocity += dvdt * time_step;
 
-        body.velocity.add_mut(&dvdt.multiply(time_step));
-        body.position.add_mut(dxdt.multiply_mut(time_step));
         body.acceleration = dvdt;
     }
 
@@ -133,9 +132,9 @@ pub fn symplectic_mt(
     local_bodies: &Vec<AstronomicalObject>,
     start: (usize, usize),
     end: (usize, usize),
-) -> Result<Vec<Vector3d>, (usize, usize)> {
+) -> Result<Vec<DVec3>, (usize, usize)> {
     let num_bodies = local_bodies.len();
-    let mut acceleration_vectors = vec![Vector3d::default(); num_bodies];
+    let mut acceleration_vectors = vec![DVec3::ZERO; num_bodies];
 
     let start_i = start.0;
     let start_j = start.1;
@@ -154,7 +153,7 @@ pub fn symplectic_mt(
 
             let (a, b) = (&local_bodies[first], &local_bodies[second]);
 
-            let difference = b.position.substract(&a.position);
+            let difference = b.position - a.position;
             let distance = difference.length();
 
             if distance <= a.radius + b.radius {
@@ -162,23 +161,23 @@ pub fn symplectic_mt(
             }
             let grav_mult = G / (distance.powi(3)); // Divide by r^3 to get a unit vector out of difference
 
-            acceleration_vectors[first].add_mut(&difference.multiply(grav_mult * b.mass));
-            acceleration_vectors[second].add_mut(&difference.multiply(-grav_mult * a.mass));
+            acceleration_vectors[first] += grav_mult * b.mass * difference;
+            acceleration_vectors[second] += -grav_mult * a.mass * difference;
         }
     }
 
     Ok(acceleration_vectors)
 }
 
-pub fn symplectic(local_bodies: &Vec<AstronomicalObject>) -> Result<Vec<Vector3d>, (usize, usize)> {
+pub fn symplectic(local_bodies: &Vec<AstronomicalObject>) -> Result<Vec<DVec3>, (usize, usize)> {
     let num_bodies = local_bodies.len();
-    let mut acceleration_vectors = vec![Vector3d::default(); num_bodies];
+    let mut acceleration_vectors = vec![DVec3::ZERO; num_bodies];
 
     for first in 0..local_bodies.len() - 1 {
         for second in first + 1..local_bodies.len() {
             let (a, b) = (&local_bodies[first], &local_bodies[second]);
 
-            let difference = b.position.substract(&a.position);
+            let difference = b.position - a.position;
             let distance = difference.length();
 
             if distance <= a.radius + b.radius {
@@ -186,8 +185,8 @@ pub fn symplectic(local_bodies: &Vec<AstronomicalObject>) -> Result<Vec<Vector3d
             }
             let grav_mult = G / (distance.powi(3)); // Divide by r^3 to get a unit vector out of difference
 
-            acceleration_vectors[first].add_mut(&difference.multiply(grav_mult * b.mass));
-            acceleration_vectors[second].add_mut(&difference.multiply(-grav_mult * a.mass));
+            acceleration_vectors[first] += grav_mult * b.mass * difference;
+            acceleration_vectors[second] += -grav_mult * a.mass * difference;
         }
     }
 
@@ -206,21 +205,13 @@ pub fn collide_objects(
     };
 
     let total_mass = obs[h].mass + obs[l].mass;
-    obs[h].velocity = obs[h]
-        .velocity
-        .multiply(obs[h].mass)
-        .add(&obs[l].velocity.multiply(obs[l].mass))
-        .multiply(1.0 / total_mass);
 
-    obs[h].position = obs[h].position.add(
-        &obs[l]
-            .position
-            .substract(&obs[h].position)
-            .multiply(obs[l].mass / total_mass),
-    );
+    obs[h].velocity = (obs[h].velocity * obs[h].mass + obs[l].velocity * obs[l].mass) / total_mass;
+    obs[h].position =
+        obs[h].position + (obs[l].position - obs[h].position) * (obs[l].mass / total_mass);
 
     obs[h].mass += obs[l].mass;
-    obs[h].radius *= (total_mass / obs[h].mass).powf(1.0 / 3.0);
+    obs[h].radius *= (total_mass / obs[h].mass).powf(3.0_f64.recip());
 
     println!("{} collided into {}!", obs[l].name, obs[h].name);
     obs.remove(l);
