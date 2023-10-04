@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 pub const AU: f64 = 1.495978707E11;
 pub const SOLAR_MASS: f64 = 1.98847E30;
+pub const SOLAR_RADIUS: f64 = 6.957E8;
 
 pub enum OrbitalMethod {
     Radius(f64),
@@ -52,7 +53,7 @@ impl AstronomicalObject {
             position: DVec3::ZERO,
             velocity: DVec3::ZERO,
             acceleration: DVec3::ZERO,
-            radius: 695700.0E3,
+            radius: SOLAR_RADIUS,
             magnification: 100.0,
             color: [255, 255, 0],
             uuid: Uuid::new_v4(),
@@ -246,6 +247,46 @@ impl AstronomicalObject {
         ));
 
         // system.push(AstronomicalObject {
+        //     name: "Alpha Centauri A".into(),
+        //     mass: 1.0788 * SOLAR_MASS,
+        //     position: DVec3 {
+        //         x: 4.2465 * 63241.077 * AU,
+        //         y: 0.0,
+        //         z: 0.0,
+        //     },
+        //     velocity: DVec3 {
+        //         x: 0.0,
+        //         y: 0.0,
+        //         z: 0.0,
+        //     },
+        //     acceleration: DVec3::ZERO,
+        //     radius: 1.2175 * SOLAR_RADIUS,
+        //     magnification: 50.0,
+        //     color: [255, 255, 0],
+        //     uuid: Uuid::new_v4(),
+        // });
+
+        // system.push(AstronomicalObject {
+        //     name: "Alpha Centauri B".into(),
+        //     mass: 0.9092 * SOLAR_MASS,
+        //     position: DVec3 {
+        //         x: 4.2465 * 63241.077 * AU,
+        //         y: 0.0,
+        //         z: 17.493 * AU,
+        //     },
+        //     velocity: DVec3 {
+        //         x: 0.0,
+        //         y: 0.0,
+        //         z: 0.0,
+        //     },
+        //     acceleration: DVec3::ZERO,
+        //     radius: 0.8591 * SOLAR_RADIUS,
+        //     magnification: 50.0,
+        //     color: [255, 100, 0],
+        //     uuid: Uuid::new_v4(),
+        // });
+
+        // system.push(AstronomicalObject {
         //     name: "Neutron star".into(),
         //     mass: 1.4 * SOLAR_MASS,
         //     position: Vector3d { data: [-0.7 * AU, 0.9 * AU, 50.0 * AU] },
@@ -260,9 +301,9 @@ impl AstronomicalObject {
         // system.push(AstronomicalObject {
         //     name: "Monster star".into(),
         //     mass: 25.4 * SOLAR_MASS,
-        //     position: Vector3d { data: [-0.7 * AU, 0.9 * AU, 50.0 * AU] },
-        //     velocity: Vector3d { data: [0.0, 0.0, -32000.0] },
-        //     acceleration: Vector3d::default(),
+        //     position: DVec3 { x: -0.7 * AU, y: 0.9 * AU, z: 50.0 * AU },
+        //     velocity: DVec3 { x: 0.0, y: 0.0, z: -32000.0 },
+        //     acceleration: DVec3::ZERO,
         //     radius: 20.0 * 695700.0E3,
         //     magnification: 10.0,
         //     color: [255, 255, 255],

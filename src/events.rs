@@ -1,4 +1,4 @@
-use std::{sync::atomic::Ordering, time::Instant};
+use std::{borrow::BorrowMut, sync::atomic::Ordering, time::Instant};
 
 use crate::{astronomy::AstronomicalObject, input, integration::IntegrationMethod, DrawingApp};
 
@@ -29,8 +29,29 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
                 let r = target.radius as i64;
 
                 if (tx - x as i64).pow(2) + (ty - y as i64).pow(2) <= r.pow(2) {
-                    *app.current_target.borrow_mut() = Some(target.uuid);
+                    if app.camera.lock().unwrap().animation_start.is_some() {
+                        break;
+                    }
+
+                    let mut current_target = app.current_target.borrow_mut();
+
+                    if let Some(t) = *current_target {
+                        if target.uuid == t {
+                            break;
+                        }
+                    }
+
+                    *current_target = Some(target.uuid);
                     *app.next_status_update.borrow_mut() = Instant::now();
+
+                    drop(current_target); // Important! get_paint_objects acquires both of the locks and can cause deadlocks if this is not dropped
+
+                    let mut camera = app.camera.lock().unwrap();
+                    let start = camera.target;
+                    let start_dis = camera.distance;
+
+                    camera.start_animation(start, start_dis);
+
                     break;
                 }
             }

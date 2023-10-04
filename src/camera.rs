@@ -1,8 +1,8 @@
-use std::f64::consts::PI;
+use std::{f64::consts::PI, sync::{Arc, Mutex}, thread, time::{Duration, Instant}};
 
 use glam::{DAffine3, DVec3};
 
-use crate::astronomy::AU;
+use crate::{astronomy::AU};
 
 // For drawing camera is assumed to be situated on the positive side of the Z-axis at (0,0,1), with target being origin.
 // Matrix operations are used to transform the simulation space into camera space.
@@ -15,6 +15,9 @@ pub struct Camera {
     yaw: f64,
     pitch: f64,
     pub fov: f64,
+    animation_progress: Arc<Mutex<u32>>,
+    animation_start_distance: f64,
+    pub animation_start: Option<DVec3>
 }
 
 impl Camera {
@@ -60,6 +63,65 @@ impl Camera {
 
         self.target + direction_vec
     }
+
+    pub fn start_animation(&mut self, start: DVec3, distance: f64) {
+        self.animation_start = Some(start);
+        self.animation_start_distance = distance;
+
+        let progress_c = self.animation_progress.clone();
+        *progress_c.lock().unwrap() = 0;
+
+        thread::spawn(move || {
+            let start = Instant::now();
+            let target_time = 1.5;
+            loop {
+                {
+                    let mut progress = progress_c.lock().unwrap();
+                    let duration = (Instant::now() - start).as_secs_f64();
+
+                    if duration >= target_time {
+                        *progress = 1000;
+                        break;
+                    }
+
+                    *progress = (duration / target_time * 1000.0) as u32  ;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }    
+        });
+    }
+
+    pub fn get_animation_position(&self, target: DVec3, radius: f64) -> Option<(DVec3, f64)> {
+        let radius_multiplier = 100.0;
+        match self.animation_start {
+            Some(start) => {
+                let progress = self.animation_progress.lock().unwrap();
+                if *progress >= 1000 {
+                    return Some((target, radius * radius_multiplier))
+                } 
+
+                // let eased_progress = (*progress as f64 / 1000.0 * 2.0 * PI - PI).tanh() * 0.5 + 0.5;
+                let eased_progress = Camera::get_camera_easing(*progress);
+
+                let difference = target - start;
+                let difference_distance = radius * radius_multiplier - self.animation_start_distance;
+                Some(
+                    (difference * eased_progress + start, difference_distance * eased_progress + self.animation_start_distance)
+                )
+            },
+            None => None
+        }
+    }
+
+    fn get_camera_easing(progress: u32) -> f64 {
+        let mut progress_f64 = progress as f64 * 2.0 / 1000.0;
+        if progress_f64 < 1.0 {
+            return progress_f64.powi(3) / 2.0;
+        }
+        progress_f64 -= 2.0;
+
+        progress_f64.powi(3) / 2.0 + 1.0
+    }
 }
 
 impl Default for Camera {
@@ -70,6 +132,9 @@ impl Default for Camera {
             yaw: 0.0,
             pitch: 0.0,
             fov: 75.0,
+            animation_start: None,
+            animation_progress: Arc::new(Mutex::new(0)),
+            animation_start_distance: 0.0
         }
     }
 }

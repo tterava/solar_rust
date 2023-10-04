@@ -20,24 +20,24 @@ impl IntegrationMethod {
                 1 => vec![(1.0, 1.0)],
                 2 => vec![(0.0, 0.5), (1.0, 0.5)],
                 3 => vec![
-                    (1.0, (-24.0_f64).recip()),
+                    (1.0, -1.0 / 24.0),
                     (-2.0 / 3.0, 3.0 / 4.0),
                     (2.0 / 3.0, 7.0 / 24.0),
                 ],
                 4 => vec![
                     (
-                        (4.0 - 2.0f64.powf(4.0 / 3.0)).recip(),
-                        (2.0 - 2.0f64.powf(3.0_f64.recip())).recip(),
+                        1.0 / (4.0 - 2.0f64.powf(4.0 / 3.0)),
+                        1.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
                     ),
                     (
-                        (1.0 - 2.0f64.powf(3.0_f64.recip())) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
-                        -(2.0f64.powf(3.0_f64.recip()) / (2.0 - 2.0f64.powf(3.0_f64.recip()))),
+                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
+                        -(2.0f64.powf(1.0 / 3.0) / (2.0 - 2.0f64.powf(1.0 / 3.0))),
                     ),
                     (
-                        (1.0 - 2.0f64.powf(3.0_f64.recip())) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
-                        (2.0 - 2.0f64.powf(3.0_f64.recip())).recip(),
+                        (1.0 - 2.0f64.powf(1.0 / 3.0)) / (4.0 - 2.0f64.powf(4.0 / 3.0)),
+                        1.0 / (2.0 - 2.0f64.powf(1.0 / 3.0)),
                     ),
-                    ((4.0 - 2.0f64.powf(4.0 / 3.0)).recip(), 0.0),
+                    (1.0 / (4.0 - 2.0f64.powf(4.0 / 3.0)), 0.0),
                 ],
                 _ => vec![],
             },
@@ -55,7 +55,7 @@ struct IntermediateState {
 pub fn runge_kutta_4(
     local_bodies: &mut Vec<AstronomicalObject>,
     time_step: f64,
-) -> Result<(), (usize, usize)> {
+) -> Option<(usize, usize)> {
     let mut dt = 0.5f64 * time_step;
     let num_bodies = local_bodies.len();
 
@@ -86,7 +86,7 @@ pub fn runge_kutta_4(
                 let distance = difference.length();
 
                 if state == 0 && distance <= local_bodies[i].radius + local_bodies[j].radius {
-                    return Err((i, j)); // Process collisions before update results
+                    return Some((i, j)); // Process collisions before update results
                 }
                 let grav_modifier = G / (difference.length().powi(3));
 
@@ -124,7 +124,7 @@ pub fn runge_kutta_4(
         body.acceleration = dvdt;
     }
 
-    Ok(())
+    None
 }
 
 // https://en.wikipedia.org/wiki/Symplectic_integrator

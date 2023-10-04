@@ -195,7 +195,7 @@ fn main() {
     *app_ui.engine.framerate.lock().unwrap() = FRAMERATE;
     app_ui.engine.params.lock().unwrap().target_speed = 86400.0 * 1.0;
 
-    // for _ in 0..1000 {
+    // for _ in 0..2000 {
     //     let mut objects = app_ui.engine.objects.lock().unwrap();
     //     let orbital = AstronomicalObject::get_random_planet();
     //     let object = AstronomicalObject::place_on_orbit(orbital, &objects[0]);

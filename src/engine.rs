@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -31,6 +32,7 @@ pub struct SimulatorControl {
     pub iteration_speed: f64,
     pub time_step: f64,
     pub use_target_speed: bool,
+    pub time_elapsed: f64
 }
 
 pub struct Engine {
@@ -68,6 +70,9 @@ impl Engine {
             let mut num_threads;
             let mut time_step;
 
+            let mut time_step_counter = 0;
+            let mut time_running;
+
             {
                 let params = params_lock.lock().unwrap();
 
@@ -78,6 +83,7 @@ impl Engine {
                 } else {
                     params.time_step
                 };
+                time_running = params.time_elapsed;
             }
 
             let mut i = 0;
@@ -124,6 +130,7 @@ impl Engine {
                                                 break;
                                             }
                                             Err(indices) => {
+                                                println!("New event at {:.2} y:", (time_running + time_step_counter as f64 * time_step) / (3600.0 * 24.0 * 365.0));
                                                 integration::collide_objects(
                                                     &mut objects_local,
                                                     &indices,
@@ -140,23 +147,26 @@ impl Engine {
                             }
 
                             i += 1;
+                            time_step_counter += 1;
                         }
 
                     // RK 4
                     } else {
                         while i < steps_until_update {
-                            match integration::runge_kutta_4(&mut objects_local, time_step) {
-                                Ok(_) => {}
-                                Err(indices) => {
-                                    integration::collide_objects(&mut objects_local, &indices);
-                                    if objects_local.len() < 2 {
-                                        params_lock.lock().unwrap().is_running = false;
-                                        break;
-                                    }
+                            let collision =
+                                integration::runge_kutta_4(&mut objects_local, time_step);
+
+                            if let Some(indices) = collision {
+                                println!("New event at {:.2} y:", (time_running + time_step_counter as f64 * time_step) / (3600.0 * 24.0 * 365.0));
+                                integration::collide_objects(&mut objects_local, &indices);
+                                if objects_local.len() < 2 {
+                                    params_lock.lock().unwrap().is_running = false;
+                                    break;
                                 }
                             }
 
                             i += 1;
+                            time_step_counter += 1;
                         }
                     }
                 } else {
@@ -193,6 +203,7 @@ impl Engine {
                                                 }
                                             }
                                             Err(collision) => {
+                                                println!("New event at {:.2} y:", (time_running + time_step_counter as f64 * time_step) / (3600.0 * 24.0 * 365.0));
                                                 integration::collide_objects(
                                                     &mut objects,
                                                     collision,
@@ -229,6 +240,7 @@ impl Engine {
                             }
                         }
                         i += 1;
+                        time_step_counter += 1;
                     }
                 }
 
@@ -260,14 +272,23 @@ impl Engine {
 
                 if params.use_target_speed {
                     let target_speed = params.target_speed;
+
+                    time_running += time_step_counter as f64 * time_step;
+                    time_step_counter = 0;
+
                     time_step = target_speed / speed;
                     params.time_step = time_step;
                 } else {
-                    time_step = params.time_step;
-                    let target_speed = time_step * speed;
-                    params.target_speed = target_speed;
+                    if params.time_step != time_step {
+                        time_running += time_step_counter as f64 * time_step;
+                        time_step_counter = 0;
+                        time_step = params.time_step;
+                    }
+
+                    params.target_speed = time_step * speed;
                 }
 
+                params.time_elapsed = time_step_counter as f64 * time_step + time_running;
                 params.iteration_speed = speed;
                 time_now = new_time;
 
@@ -466,6 +487,7 @@ impl Default for Engine {
                 iteration_speed: 0.0,
                 time_step: 0.01,
                 use_target_speed: false,
+                time_elapsed: 0.0
             })),
             thread_stopped: Arc::new(Mutex::new(true)),
         }
