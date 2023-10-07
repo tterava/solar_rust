@@ -140,7 +140,7 @@ pub fn get_status_text(app: &DrawingApp) -> Vec<String> {
             }
         ),
         format!(
-            "Time step: {:.3} s {}",
+            "Timestep: {:.3} s {}",
             params.time_step,
             if params.time_step >= 86400.0 {
                 format!("({:.2} d/s)", params.time_step / 86400.0)
@@ -152,7 +152,10 @@ pub fn get_status_text(app: &DrawingApp) -> Vec<String> {
                 "".into()
             }
         ),
-        format!("Simulation time: {:.2} y", params.time_elapsed / (60.0 * 60.0 * 24.0 * 365.0)),
+        format!(
+            "Simulation time: {:.2} y",
+            params.time_elapsed / (60.0 * 60.0 * 24.0 * 365.0)
+        ),
         format!("Objects: {}", objects_len),
         format!("Method: {}", method),
         format!("Threads: {}", params.num_threads),
@@ -237,19 +240,17 @@ pub fn get_paint_objects(app: &DrawingApp) -> Vec<(i32, i32, i32, i32, HBRUSH)> 
 
     if let Some(target) = *target_opt {
         camera.target = match bodies.iter().find(|x| x.uuid == target) {
-            Some(b) => {
-                match camera.get_animation_position(b.position, b.radius) {
-                    Some((target, distance)) => {
-                        camera.distance = distance;
+            Some(b) => match camera.get_animation_position(b.position, b.radius) {
+                Some((target, distance)) => {
+                    camera.distance = distance;
 
-                        if target == b.position {
-                            camera.animation_start = None;
-                        }
+                    if target == b.position {
+                        camera.animation_start = None;
+                    }
 
-                        target
-                    },
-                    None => b.position
+                    target
                 }
+                None => b.position,
             },
             None => {
                 *target_opt = None;

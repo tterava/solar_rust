@@ -1,4 +1,6 @@
-use std::{borrow::BorrowMut, sync::atomic::Ordering, time::Instant};
+use std::{sync::atomic::Ordering, time::Instant};
+
+use rand::SeedableRng;
 
 use crate::{astronomy::AstronomicalObject, input, integration::IntegrationMethod, DrawingApp};
 
@@ -131,9 +133,11 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
                         }
 
                         let mut objects = app.engine.objects.lock().unwrap();
+                        let mut rng = rand::rngs::StdRng::from_entropy();
                         let new_object = AstronomicalObject::place_on_orbit(
-                            AstronomicalObject::get_random_planet(),
+                            AstronomicalObject::get_random_planet(&mut rng),
                             &objects[0],
+                            &mut rng
                         );
                         objects.push(new_object);
                         *app.next_status_update.borrow_mut() = Instant::now();

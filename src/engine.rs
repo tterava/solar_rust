@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use glam::DVec3;
+use rand::rngs::StdRng;
 
 use crate::astronomy::AstronomicalObject;
 use crate::integration::{self, IntegrationMethod, G};
@@ -32,7 +32,7 @@ pub struct SimulatorControl {
     pub iteration_speed: f64,
     pub time_step: f64,
     pub use_target_speed: bool,
-    pub time_elapsed: f64
+    pub time_elapsed: f64,
 }
 
 pub struct Engine {
@@ -70,7 +70,7 @@ impl Engine {
             let mut num_threads;
             let mut time_step;
 
-            let mut time_step_counter = 0;
+            let mut time_step_counter: u128 = 0;
             let mut time_running;
 
             {
@@ -130,7 +130,12 @@ impl Engine {
                                                 break;
                                             }
                                             Err(indices) => {
-                                                println!("New event at {:.2} y:", (time_running + time_step_counter as f64 * time_step) / (3600.0 * 24.0 * 365.0));
+                                                println!(
+                                                    "New event at {:.2} y:",
+                                                    (time_running
+                                                        + time_step_counter as f64 * time_step)
+                                                        / (3600.0 * 24.0 * 365.0)
+                                                );
                                                 integration::collide_objects(
                                                     &mut objects_local,
                                                     &indices,
@@ -157,7 +162,11 @@ impl Engine {
                                 integration::runge_kutta_4(&mut objects_local, time_step);
 
                             if let Some(indices) = collision {
-                                println!("New event at {:.2} y:", (time_running + time_step_counter as f64 * time_step) / (3600.0 * 24.0 * 365.0));
+                                println!(
+                                    "New event at {:.2} y:",
+                                    (time_running + time_step_counter as f64 * time_step)
+                                        / (3600.0 * 24.0 * 365.0)
+                                );
                                 integration::collide_objects(&mut objects_local, &indices);
                                 if objects_local.len() < 2 {
                                     params_lock.lock().unwrap().is_running = false;
@@ -203,7 +212,12 @@ impl Engine {
                                                 }
                                             }
                                             Err(collision) => {
-                                                println!("New event at {:.2} y:", (time_running + time_step_counter as f64 * time_step) / (3600.0 * 24.0 * 365.0));
+                                                println!(
+                                                    "New event at {:.2} y:",
+                                                    (time_running
+                                                        + time_step_counter as f64 * time_step)
+                                                        / (3600.0 * 24.0 * 365.0)
+                                                );
                                                 integration::collide_objects(
                                                     &mut objects,
                                                     collision,
@@ -472,12 +486,10 @@ impl Engine {
 
         None
     }
-}
 
-impl Default for Engine {
-    fn default() -> Self {
+    pub fn default(rng: &mut StdRng) -> Self {
         Engine {
-            objects: Arc::new(Mutex::new(AstronomicalObject::default())),
+            objects: Arc::new(Mutex::new(AstronomicalObject::default(rng))),
             framerate: Arc::new(Mutex::new(60)),
             params: Arc::new(Mutex::new(SimulatorControl {
                 target_speed: 86400.0 * 1.0,
@@ -487,9 +499,10 @@ impl Default for Engine {
                 iteration_speed: 0.0,
                 time_step: 0.01,
                 use_target_speed: false,
-                time_elapsed: 0.0
+                time_elapsed: 0.0,
             })),
             thread_stopped: Arc::new(Mutex::new(true)),
         }
     }
 }
+

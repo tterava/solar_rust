@@ -1,8 +1,13 @@
-use std::{f64::consts::PI, sync::{Arc, Mutex}, thread, time::{Duration, Instant}};
+use std::{
+    f64::consts::PI,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 use glam::{DAffine3, DVec3};
 
-use crate::{astronomy::AU};
+use crate::astronomy::AU;
 
 // For drawing camera is assumed to be situated on the positive side of the Z-axis at (0,0,1), with target being origin.
 // Matrix operations are used to transform the simulation space into camera space.
@@ -17,7 +22,7 @@ pub struct Camera {
     pub fov: f64,
     animation_progress: Arc<Mutex<u32>>,
     animation_start_distance: f64,
-    pub animation_start: Option<DVec3>
+    pub animation_start: Option<DVec3>,
 }
 
 impl Camera {
@@ -84,10 +89,10 @@ impl Camera {
                         break;
                     }
 
-                    *progress = (duration / target_time * 1000.0) as u32  ;
+                    *progress = (duration / target_time * 1000.0) as u32;
                 }
                 thread::sleep(Duration::from_millis(10));
-            }    
+            }
         });
     }
 
@@ -97,19 +102,21 @@ impl Camera {
             Some(start) => {
                 let progress = self.animation_progress.lock().unwrap();
                 if *progress >= 1000 {
-                    return Some((target, radius * radius_multiplier))
-                } 
+                    return Some((target, radius * radius_multiplier));
+                }
 
                 // let eased_progress = (*progress as f64 / 1000.0 * 2.0 * PI - PI).tanh() * 0.5 + 0.5;
                 let eased_progress = Camera::get_camera_easing(*progress);
 
                 let difference = target - start;
-                let difference_distance = radius * radius_multiplier - self.animation_start_distance;
-                Some(
-                    (difference * eased_progress + start, difference_distance * eased_progress + self.animation_start_distance)
-                )
-            },
-            None => None
+                let difference_distance =
+                    radius * radius_multiplier - self.animation_start_distance;
+                Some((
+                    difference * eased_progress + start,
+                    difference_distance * eased_progress + self.animation_start_distance,
+                ))
+            }
+            None => None,
         }
     }
 
@@ -134,7 +141,7 @@ impl Default for Camera {
             fov: 75.0,
             animation_start: None,
             animation_progress: Arc::new(Mutex::new(0)),
-            animation_start_distance: 0.0
+            animation_start_distance: 0.0,
         }
     }
 }

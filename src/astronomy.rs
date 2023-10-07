@@ -4,7 +4,7 @@ use std::f64::consts::PI;
 use crate::integration::G;
 
 use glam::{DAffine3, DVec3};
-use rand::Rng;
+use rand::{rngs::StdRng, Rng};
 use uuid::Uuid;
 
 pub const AU: f64 = 1.495978707E11;
@@ -46,7 +46,7 @@ pub struct AstronomicalObject {
 }
 
 impl AstronomicalObject {
-    pub fn default() -> Vec<AstronomicalObject> {
+    pub fn default(rng: &mut StdRng) -> Vec<AstronomicalObject> {
         let mut system = vec![AstronomicalObject {
             name: "Sun".to_string(),
             mass: SOLAR_MASS,
@@ -70,6 +70,7 @@ impl AstronomicalObject {
                 color: [255, 0, 0],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
+            rng,
         ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -83,6 +84,7 @@ impl AstronomicalObject {
                 color: [0, 255, 0],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
+            rng,
         ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -96,6 +98,7 @@ impl AstronomicalObject {
                 color: [0, 0, 255],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
+            rng,
         ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -110,6 +113,7 @@ impl AstronomicalObject {
                 color: [255, 255, 255],
             },
             system.iter().find(|x| x.name == "Earth").unwrap(),
+            rng,
         ));
         // system.push(AstronomicalObject::place_on_orbit(
         //     OrbitalObject {
@@ -137,6 +141,7 @@ impl AstronomicalObject {
                 color: [255, 50, 0],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
+            rng,
         ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -150,6 +155,7 @@ impl AstronomicalObject {
                 color: [216, 202, 157],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
+            rng,
         ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -163,6 +169,7 @@ impl AstronomicalObject {
                 color: [191, 189, 175],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
+            rng,
         ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -176,6 +183,7 @@ impl AstronomicalObject {
                 color: [209, 231, 231],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
+            rng,
         ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -189,6 +197,7 @@ impl AstronomicalObject {
                 color: [39, 70, 135],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
+            rng,
         ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -202,6 +211,7 @@ impl AstronomicalObject {
                 color: [200, 200, 200],
             },
             system.iter().find(|x| x.name == "Mars").unwrap(),
+            rng,
         ));
         system.push(AstronomicalObject::place_on_orbit(
             OrbitalObject {
@@ -215,6 +225,7 @@ impl AstronomicalObject {
                 color: [150, 150, 150],
             },
             system.iter().find(|x| x.name == "Mars").unwrap(),
+            rng,
         ));
 
         // Never 4get
@@ -230,6 +241,7 @@ impl AstronomicalObject {
                 color: [190, 190, 255],
             },
             system.iter().find(|x| x.name == "Sun").unwrap(),
+            rng,
         ));
 
         system.push(AstronomicalObject::place_on_orbit(
@@ -244,6 +256,7 @@ impl AstronomicalObject {
                 color: [0, 0, 160],
             },
             system.iter().find(|x| x.name == "Earth").unwrap(),
+            rng,
         ));
 
         // system.push(AstronomicalObject {
@@ -340,9 +353,11 @@ impl AstronomicalObject {
         Ordering::Equal
     }
 
-    pub fn place_on_orbit(obj: OrbitalObject, target: &AstronomicalObject) -> AstronomicalObject {
-        let mut rng = rand::thread_rng();
-
+    pub fn place_on_orbit(
+        obj: OrbitalObject,
+        target: &AstronomicalObject,
+        rng: &mut StdRng,
+    ) -> AstronomicalObject {
         let (mut speed, radius);
         match obj.method {
             OrbitalMethod::Radius(r) => {
@@ -389,9 +404,7 @@ impl AstronomicalObject {
         }
     }
 
-    pub fn get_random_planet() -> OrbitalObject {
-        let mut rng = rand::thread_rng();
-
+    pub fn get_random_planet(rng: &mut StdRng) -> OrbitalObject {
         let density_earth = 5.972168E24 / 6371.0E3f64.powi(3);
         let mass = rng.gen_range(1.303E22..=6.8982E27);
         let radius = (mass / density_earth).powf(3.0_f64.recip());

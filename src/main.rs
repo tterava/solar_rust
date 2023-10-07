@@ -15,6 +15,7 @@ extern crate native_windows_derive as nwd;
 use astronomy::AstronomicalObject;
 use nwd::NwgUi;
 use nwg::{NativeUi, ExternCanvas, Window};
+use rand::SeedableRng;
 use ui::TargetData;
 use uuid::Uuid;
 use std::sync::atomic::AtomicBool;
@@ -171,6 +172,8 @@ impl DrawingApp {
 }
 
 fn main() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
     nwg::init().expect("Failed to init Native Windows GUI");
     nwg::Font::set_global_family("Segoe UI").expect("Failed to set default font");
 
@@ -180,7 +183,7 @@ fn main() {
         window: Window::default(),
         canvas: ExternCanvas::default(),
         paint_data: RefCell::new(PaintData::default()),
-        engine: Engine::default(),
+        engine: Engine::default(&mut rng),
         is_dragging: Arc::new(AtomicBool::new(false)),
         current_target: RefCell::new(None),
         targets: RefCell::new(Vec::new()),
