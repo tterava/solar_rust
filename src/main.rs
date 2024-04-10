@@ -198,13 +198,13 @@ fn main() {
     *app_ui.engine.framerate.lock().unwrap() = FRAMERATE;
     app_ui.engine.params.lock().unwrap().target_speed = 86400.0 * 1.0;
 
-    // for _ in 0..2000 {
-    //     let mut objects = app_ui.engine.objects.lock().unwrap();
-    //     let orbital = AstronomicalObject::get_random_planet();
-    //     let object = AstronomicalObject::place_on_orbit(orbital, &objects[0]);
+    for _ in 0..2000 {
+        let mut objects = app_ui.engine.objects.lock().unwrap();
+        let orbital = AstronomicalObject::get_random_planet(&mut rng);
+        let object = AstronomicalObject::place_on_orbit(orbital, &objects[0], &mut rng);
 
-    //     objects.push(object);
-    // }
+        objects.push(object);
+    }
     
     app_ui.animation_timer.start();        
     nwg::dispatch_thread_events();

@@ -31,7 +31,7 @@ impl Camera {
     }
     pub fn set_pitch(&mut self, angle: f64) {
         // Limit pitch between -89.9 degrees and 89.9 degrees or things go upside down.
-        self.pitch = angle.min(PI / 180.0 * 89.9).max(-PI / 180.0 * 89.9);
+        self.pitch = angle.clamp(-PI / 180.0 * 89.9, PI / 180.0 * 89.9);
     }
 
     pub fn get_yaw(&self) -> f64 {
@@ -138,7 +138,7 @@ impl Default for Camera {
             distance: 2.0 * AU,
             yaw: 0.0,
             pitch: 0.0,
-            fov: 75.0,
+            fov: 80.0,
             animation_start: None,
             animation_progress: Arc::new(Mutex::new(0)),
             animation_start_distance: 0.0,

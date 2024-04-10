@@ -53,7 +53,7 @@ struct IntermediateState {
 }
 
 pub fn runge_kutta_4(
-    local_bodies: &mut Vec<AstronomicalObject>,
+    local_bodies: &mut [AstronomicalObject],
     time_step: f64,
 ) -> Option<(usize, usize)> {
     let mut dt = 0.5f64 * time_step;
@@ -129,7 +129,7 @@ pub fn runge_kutta_4(
 
 // https://en.wikipedia.org/wiki/Symplectic_integrator
 pub fn symplectic_mt(
-    local_bodies: &Vec<AstronomicalObject>,
+    local_bodies: &[AstronomicalObject],
     start: (usize, usize),
     end: (usize, usize),
 ) -> Result<Vec<DVec3>, (usize, usize)> {
@@ -169,7 +169,7 @@ pub fn symplectic_mt(
     Ok(acceleration_vectors)
 }
 
-pub fn symplectic(local_bodies: &Vec<AstronomicalObject>) -> Result<Vec<DVec3>, (usize, usize)> {
+pub fn symplectic(local_bodies: &[AstronomicalObject]) -> Result<Vec<DVec3>, (usize, usize)> {
     let num_bodies = local_bodies.len();
     let mut acceleration_vectors = vec![DVec3::ZERO; num_bodies];
 

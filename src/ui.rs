@@ -62,10 +62,10 @@ pub fn paint(app: &DrawingApp, data: &nwg::EventData) {
         let line_height = 18;
         let text_start_y = size.1 as i32 - status_lines.len() as i32 * line_height - 5;
 
-        let params = app.engine.params.lock().unwrap();
+        let use_target_speed = app.engine.params.lock().unwrap().use_target_speed;
         for (i, text_str) in status_lines.iter().enumerate() {
             let text = text_str.encode_utf16().collect::<Vec<u16>>();
-            if params.use_target_speed && i == 0 || !params.use_target_speed && i == 1 {
+            if use_target_speed && i == 0 || !use_target_speed && i == 1 {
                 SelectObject(mem_dc, p.font_bold as _);
             } else {
                 SelectObject(mem_dc, p.font as _);
@@ -102,12 +102,8 @@ pub fn paint(app: &DrawingApp, data: &nwg::EventData) {
 }
 
 pub fn get_status_text(app: &DrawingApp) -> Vec<String> {
-    let objects_len;
-    {
-        objects_len = app.engine.objects.lock().unwrap().len(); // get len early to avoid holding two locks at once
-    }
-
-    let params = app.engine.params.lock().unwrap();
+    let objects_len = app.engine.objects.lock().unwrap().len();
+    let params = app.engine.params.lock().unwrap().clone();
 
     let method = match params.method {
         IntegrationMethod::Symplectic(k) => {
@@ -132,7 +128,7 @@ pub fn get_status_text(app: &DrawingApp) -> Vec<String> {
             if params.target_speed >= 86400.0 * 365.0 {
                 format!("({:.2} y/s)", params.target_speed / 86400.0 / 365.0)
             } else if params.target_speed <= 3600.0 {
-                format!("({:.2} min/s)", params.target_speed / 60.0)
+                format!("({:.2} m/s)", params.target_speed / 60.0)
             } else if params.target_speed <= 3600.0 * 24.0 {
                 format!("({:.2} h/s)", params.target_speed / 3600.0)
             } else {
@@ -143,11 +139,11 @@ pub fn get_status_text(app: &DrawingApp) -> Vec<String> {
             "Timestep: {:.3} s {}",
             params.time_step,
             if params.time_step >= 86400.0 {
-                format!("({:.2} d/s)", params.time_step / 86400.0)
+                format!("({:.2} d)", params.time_step / 86400.0)
             } else if params.time_step >= 3600.0 {
-                format!("({:.2} h/s)", params.time_step / 3600.0)
+                format!("({:.2} h)", params.time_step / 3600.0)
             } else if params.time_step >= 60.0 {
-                format!("({:.2} min/s)", params.time_step / 60.0)
+                format!("({:.2} m)", params.time_step / 60.0)
             } else {
                 "".into()
             }
@@ -167,7 +163,7 @@ pub fn get_status_text(app: &DrawingApp) -> Vec<String> {
 
 pub fn get_object_description_text(app: &DrawingApp) -> Vec<String> {
     let obj;
-    let objects = app.engine.objects.lock().unwrap();
+    let objects = app.engine.objects.lock().unwrap().clone();
     if let Some(target) = *app.current_target.borrow() {
         if let Some(object) = objects.iter().find(|x| x.uuid == target) {
             obj = object;

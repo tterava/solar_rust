@@ -23,7 +23,7 @@ struct WorkerControl {
     worker_kill: Arc<AtomicBool>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SimulatorControl {
     pub target_speed: f64,
     pub is_running: bool, // For outside communication
@@ -66,49 +66,42 @@ impl Engine {
         let framerate = *self.framerate.lock().unwrap() as f64;
 
         thread::spawn(move || {
-            let mut method;
-            let mut num_threads;
-            let mut time_step;
+            let mut params_local = params_lock.lock().unwrap().clone();
 
+            let mut time_step = if params_local.use_target_speed {
+                0.001f64
+            } else {
+                params_local.time_step
+            };
+
+            let mut time_running = params_local.time_elapsed;
             let mut time_step_counter: u128 = 0;
-            let mut time_running;
-
-            {
-                let params = params_lock.lock().unwrap();
-
-                method = params.method.clone();
-                num_threads = params.num_threads;
-                time_step = if params.use_target_speed {
-                    0.001f64
-                } else {
-                    params.time_step
-                };
-                time_running = params.time_elapsed;
-            }
 
             let mut i = 0;
             let mut steps_until_update = 1000u128;
 
-            let mut use_symplectic = match method {
+            let mut use_symplectic = match params_local.method {
                 IntegrationMethod::Symplectic(_) => true,
                 IntegrationMethod::RK4 => false,
             };
 
             // Prepare threads if needed
-            let mut state =
-                Engine::prepare_worker_threads(num_threads, objects_local.read().unwrap().len());
+            let mut state = Engine::prepare_worker_threads(
+                params_local.num_threads,
+                objects_local.read().unwrap().len(),
+            );
             let mut handles = vec![];
 
-            if use_symplectic && num_threads > 1 {
+            if use_symplectic && params_local.num_threads > 1 {
                 handles = Engine::start_worker_threads(&state, &objects_local);
             }
 
             let mut time_now = Instant::now();
             loop {
-                if num_threads == 1 || !use_symplectic {
+                if params_local.num_threads == 1 || !use_symplectic {
                     let mut objects_local = objects_local.write().unwrap();
                     if use_symplectic {
-                        let coefficient_table = method.get_coefficients();
+                        let coefficient_table = params_local.method.get_coefficients();
                         'outer_integration_loop: while i < steps_until_update {
                             for (c, d) in coefficient_table.iter() {
                                 objects_local.iter_mut().for_each(|x| {
@@ -179,7 +172,7 @@ impl Engine {
                         }
                     }
                 } else {
-                    let coefficient_table = method.get_coefficients();
+                    let coefficient_table = params_local.method.get_coefficients();
                     'outer_integration_loop: while i < steps_until_update {
                         for (c, d) in coefficient_table.iter() {
                             if *c != 0.0 {
@@ -233,7 +226,7 @@ impl Engine {
 
                                                 *work_queue = Engine::get_mt_splices(
                                                     objects.len(),
-                                                    num_threads,
+                                                    params_local.num_threads,
                                                 );
 
                                                 continue 'integration_loop;
@@ -307,8 +300,8 @@ impl Engine {
                 time_now = new_time;
 
                 if !params.is_running
-                    || num_threads != params.num_threads
-                    || method != params.method
+                    || params_local.num_threads != params.num_threads
+                    || params_local.method != params.method
                 {
                     if !handles.is_empty() {
                         state
@@ -323,22 +316,21 @@ impl Engine {
                         break;
                     }
 
-                    method = params.method.clone();
-                    num_threads = params.num_threads;
+                    params_local = params.clone();
 
-                    use_symplectic = match method {
+                    use_symplectic = match params_local.method {
                         IntegrationMethod::Symplectic(_) => true,
                         IntegrationMethod::RK4 => false,
                     };
 
                     // Prepare threads if needed
                     state = Engine::prepare_worker_threads(
-                        num_threads,
+                        params_local.num_threads,
                         objects_local.read().unwrap().len(),
                     );
                     handles = vec![];
 
-                    if use_symplectic && num_threads > 1 {
+                    if use_symplectic && params_local.num_threads > 1 {
                         handles = Engine::start_worker_threads(&state, &objects_local);
                     }
                 }
@@ -428,21 +420,24 @@ impl Engine {
                     if kill_lock.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    {
-                        let work_item_queue = work_queue_lock.read().unwrap();
-                        if work_item_queue.len() > i_thread {
-                            let work_item = &work_queue_lock.read().unwrap()[i_thread];
-                            let objects = objects_lock.read().unwrap();
 
-                            let mut result = result_lock.lock().unwrap();
-                            *result = integration::symplectic_mt(
-                                &objects,
-                                work_item.start,
-                                work_item.end,
-                            );
-                        }
+                    let work_item_queue = work_queue_lock.read().unwrap();
+
+                    if work_item_queue.len() <= i_thread {
+                        drop(work_item_queue);
+                        barrier_lock.wait();
+                        continue;
                     }
 
+                    let work_item = &work_item_queue[i_thread];
+                    let objects = objects_lock.read().unwrap();
+
+                    let integration_result =
+                        integration::symplectic_mt(&objects, work_item.start, work_item.end);
+
+                    *result_lock.lock().unwrap() = integration_result;
+
+                    drop(work_item_queue);
                     barrier_lock.wait(); // Important to have two barrier waits. Main thread prepares work between
                 }
             });
@@ -505,4 +500,3 @@ impl Engine {
         }
     }
 }
-

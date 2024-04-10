@@ -66,6 +66,7 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
         E::OnKeyPress => {
             if let K(key) = evt_data {
                 match key {
+                    // Numpad +
                     107 => {
                         let mut params = app.engine.params.lock().unwrap();
                         if params.use_target_speed {
@@ -76,6 +77,7 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
 
                         *app.next_status_update.borrow_mut() = Instant::now();
                     }
+                    // Numpad -
                     109 => {
                         let mut params = app.engine.params.lock().unwrap();
                         if params.use_target_speed {
@@ -86,6 +88,7 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
 
                         *app.next_status_update.borrow_mut() = Instant::now();
                     }
+                    // Space
                     32 => {
                         if app.engine.params.lock().unwrap().is_running {
                             app.engine.stop();
@@ -93,6 +96,7 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
                             app.engine.start_mt();
                         }
                     }
+                    // Number keys
                     49..=57 => {
                         let threads = key - 48;
                         let mut params = app.engine.params.lock().unwrap();
@@ -100,18 +104,21 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
                         params.num_threads = threads as usize;
                         *app.next_status_update.borrow_mut() = Instant::now();
                     }
+                    // q
                     81 => {
                         let mut params = app.engine.params.lock().unwrap();
 
                         params.num_threads = (params.num_threads - 1).max(1);
                         *app.next_status_update.borrow_mut() = Instant::now();
                     }
+                    // w
                     87 => {
                         let mut params = app.engine.params.lock().unwrap();
 
                         params.num_threads += 1;
                         *app.next_status_update.borrow_mut() = Instant::now();
                     }
+                    // m
                     77 => {
                         let mut params = app.engine.params.lock().unwrap();
                         params.method = match params.method {
@@ -126,6 +133,7 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
                         };
                         *app.next_status_update.borrow_mut() = Instant::now();
                     }
+                    // t
                     82 => {
                         let params = app.engine.params.lock().unwrap();
                         if params.is_running {
@@ -142,6 +150,7 @@ pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData
                         objects.push(new_object);
                         *app.next_status_update.borrow_mut() = Instant::now();
                     }
+                    // n
                     84 => {
                         let mut params = app.engine.params.lock().unwrap();
                         params.use_target_speed = !params.use_target_speed;
