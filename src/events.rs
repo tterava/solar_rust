@@ -42,7 +42,17 @@ pub fn handle_input(app: &mut SolarApp, ui: &Ui, response: &Response) {
                     let start = app.camera.target;
                     let start_dis = app.camera.distance;
 
-                    app.camera.start_animation(start, start_dis);
+                    let start_target = app
+                        .engine
+                        .objects
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|x| x.uuid == target.uuid)
+                        .map(|b| b.position)
+                        .unwrap_or(start);
+
+                    app.camera.start_animation(start, start_dis, start_target);
 
                     break;
                 }

@@ -23,6 +23,7 @@ pub struct Camera {
     animation_progress: Arc<Mutex<u32>>,
     animation_start_distance: f64,
     pub animation_start: Option<DVec3>,
+    animation_start_target: DVec3,
 }
 
 impl Camera {
@@ -69,9 +70,10 @@ impl Camera {
         self.target + direction_vec
     }
 
-    pub fn start_animation(&mut self, start: DVec3, distance: f64) {
+    pub fn start_animation(&mut self, start: DVec3, distance: f64, start_target: DVec3) {
         self.animation_start = Some(start);
         self.animation_start_distance = distance;
+        self.animation_start_target = start_target;
 
         let progress_c = self.animation_progress.clone();
         *progress_c.lock().unwrap() = 0;
@@ -108,11 +110,17 @@ impl Camera {
                 // let eased_progress = (*progress as f64 / 1000.0 * 2.0 * PI - PI).tanh() * 0.5 + 0.5;
                 let eased_progress = Camera::get_camera_easing(*progress);
 
-                let difference = target - start;
+                // Interpolate along a fixed path between the camera's start point and where the
+                // target body was when the animation began, then add the body's own motion 1:1.
+                // This way a moving (or fast-orbiting) body never makes the camera overshoot.
+                let base =
+                    start + (self.animation_start_target - start) * eased_progress;
+                let follow = target - self.animation_start_target;
+
                 let difference_distance =
                     radius * radius_multiplier - self.animation_start_distance;
                 Some((
-                    difference * eased_progress + start,
+                    base + follow,
                     difference_distance * eased_progress + self.animation_start_distance,
                 ))
             }
@@ -140,6 +148,7 @@ impl Default for Camera {
             pitch: 0.0,
             fov: 80.0,
             animation_start: None,
+            animation_start_target: DVec3::ZERO,
             animation_progress: Arc::new(Mutex::new(0)),
             animation_start_distance: 0.0,
         }
