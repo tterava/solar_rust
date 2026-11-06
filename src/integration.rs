@@ -88,7 +88,7 @@ pub fn runge_kutta_4(
                 if state == 0 && distance <= local_bodies[i].radius + local_bodies[j].radius {
                     return Some((i, j)); // Process collisions before update results
                 }
-                let grav_modifier = G / (difference.length().powi(3));
+                let grav_modifier = G / (distance * distance * distance);
 
                 dv[i] += grav_modifier * local_bodies[j].mass * difference;
                 dv[j] += -grav_modifier * local_bodies[i].mass * difference;
@@ -159,7 +159,7 @@ pub fn symplectic_mt(
             if distance <= a.radius + b.radius {
                 return Err((first, second)); // Process collisions before update results
             }
-            let grav_mult = G / (distance.powi(3)); // Divide by r^3 to get a unit vector out of difference
+            let grav_mult = G / (distance * distance * distance); // Divide by r^3 to get a unit vector out of difference
 
             acceleration_vectors[first] += grav_mult * b.mass * difference;
             acceleration_vectors[second] += -grav_mult * a.mass * difference;
@@ -169,9 +169,13 @@ pub fn symplectic_mt(
     Ok(acceleration_vectors)
 }
 
-pub fn symplectic(local_bodies: &[AstronomicalObject]) -> Result<Vec<DVec3>, (usize, usize)> {
-    let num_bodies = local_bodies.len();
-    let mut acceleration_vectors = vec![DVec3::ZERO; num_bodies];
+// Same as symplectic, but accumulates into a reusable buffer to avoid a per-step allocation
+pub fn symplectic_into(
+    local_bodies: &[AstronomicalObject],
+    acceleration_vectors: &mut Vec<DVec3>,
+) -> Result<(), (usize, usize)> {
+    acceleration_vectors.clear();
+    acceleration_vectors.resize(local_bodies.len(), DVec3::ZERO);
 
     for first in 0..local_bodies.len() - 1 {
         for second in first + 1..local_bodies.len() {
@@ -183,14 +187,14 @@ pub fn symplectic(local_bodies: &[AstronomicalObject]) -> Result<Vec<DVec3>, (us
             if distance <= a.radius + b.radius {
                 return Err((first, second)); // Process collisions before update results
             }
-            let grav_mult = G / (distance.powi(3)); // Divide by r^3 to get a unit vector out of difference
+            let grav_mult = G / (distance * distance * distance); // Divide by r^3 to get a unit vector out of difference
 
             acceleration_vectors[first] += grav_mult * b.mass * difference;
             acceleration_vectors[second] += -grav_mult * a.mass * difference;
         }
     }
 
-    Ok(acceleration_vectors)
+    Ok(())
 }
 
 pub fn collide_objects(
@@ -211,7 +215,7 @@ pub fn collide_objects(
         obs[h].position + (obs[l].position - obs[h].position) * (obs[l].mass / total_mass);
 
     obs[h].mass += obs[l].mass;
-    obs[h].radius *= (total_mass / obs[h].mass).powf(3.0_f64.recip());
+    obs[h].radius *= (total_mass / obs[h].mass).cbrt();
 
     println!("{} collided into {}!", obs[l].name, obs[h].name);
     obs.remove(l);

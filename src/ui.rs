@@ -1,107 +1,161 @@
 use std::time::{Duration, Instant};
 
+use egui::{Align2, Color32, FontId, Painter, Pos2, Response, Shape, Stroke};
 use glam::DVec3;
 use uuid::Uuid;
-use winapi::{
-    shared::windef::HBRUSH,
-    um::wingdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, Ellipse,
-        SelectObject, SetBkMode, SetTextColor, TextOutW, RGB, SRCCOPY, TRANSPARENT,
-    },
-};
 
-use crate::{engine, integration::IntegrationMethod, DrawingApp};
+use crate::engine;
+use crate::integration::IntegrationMethod;
+use crate::SolarApp;
+
 pub struct TargetData {
     pub uuid: Uuid,
-    pub x: f64,
-    pub y: f64,
-    pub radius: f64,
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
 }
 
-pub fn paint(app: &DrawingApp, data: &nwg::EventData) {
-    let paint_objects = get_paint_objects(app);
+pub fn paint(app: &mut SolarApp, painter: &Painter, response: &Response) {
     let now = Instant::now();
 
-    let mut status_lines = app.status_lines.borrow_mut();
-    let mut object_description = app.object_description.borrow_mut();
-
-    if *app.next_status_update.borrow() <= now {
-        *status_lines = get_status_text(app);
-        *object_description = get_object_description_text(app);
-        *app.next_status_update.borrow_mut() = Instant::now() + Duration::from_millis(500);
+    if app.next_status_update <= now {
+        app.status_lines = get_status_text(app);
+        app.object_description = get_object_description_text(app);
+        app.next_status_update = Instant::now() + Duration::from_millis(500);
     }
 
-    use winapi::um::winuser::{FillRect, FrameRect};
+    let rect = response.rect;
+    let screen_width = rect.width() as f64;
+    let screen_height = rect.height() as f64;
 
-    let paint = data.on_paint();
-    let ps = paint.begin_paint();
+    let bodies = app.engine.objects.lock().unwrap();
+    let camera = &mut app.camera;
 
-    unsafe {
-        let p = app.paint_data.borrow();
-        let hdc = ps.hdc;
-        let rc = &ps.rcPaint;
+    let screen_scalar = screen_width / 2.0 / (camera.fov / 2.0).to_radians().tan();
 
-        // Use mem_dc to avoid flickering
-        let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-        let prev_bitmap = SelectObject(mem_dc, mem_bitmap as _);
+    if let Some(target) = app.current_target {
+        if let Some(b) = bodies.iter().find(|x| x.uuid == target) {
+            camera.target = match camera.get_animation_position(b.position, b.radius) {
+                Some((target, distance)) => {
+                    camera.distance = distance;
 
-        FillRect(mem_dc, rc, p.background as _);
-        SelectObject(mem_dc, p.pen as _);
+                    if target == b.position {
+                        camera.animation_start = None;
+                    }
 
-        for (left_x, right_x, top_y, bottom_y, brush) in paint_objects.iter() {
-            SelectObject(mem_dc, *brush as _);
-            Ellipse(mem_dc, *left_x, *top_y, *right_x, *bottom_y);
+                    target
+                }
+                None => b.position,
+            };
+        } else {
+            app.current_target = None;
+            camera.target = DVec3::ZERO;
         }
-
-        FrameRect(mem_dc, rc, p.border as _);
-
-        SetTextColor(mem_dc, RGB(255, 255, 255));
-        SetBkMode(mem_dc, TRANSPARENT as i32);
-        let size = app.canvas.size();
-        let line_height = 18;
-        let text_start_y = size.1 as i32 - status_lines.len() as i32 * line_height - 5;
-
-        let use_target_speed = app.engine.params.lock().unwrap().use_target_speed;
-        for (i, text_str) in status_lines.iter().enumerate() {
-            let text = text_str.encode_utf16().collect::<Vec<u16>>();
-            if use_target_speed && i == 0 || !use_target_speed && i == 1 {
-                SelectObject(mem_dc, p.font_bold as _);
-            } else {
-                SelectObject(mem_dc, p.font as _);
-            }
-            TextOutW(
-                mem_dc,
-                5,
-                text_start_y + i as i32 * 18,
-                text.as_ptr(),
-                text.len() as i32,
-            );
-        }
-
-        SelectObject(mem_dc, p.font as _);
-        for (i, text_str) in object_description.iter().enumerate() {
-            let text = text_str.encode_utf16().collect::<Vec<u16>>();
-            TextOutW(
-                mem_dc,
-                5,
-                5 + i as i32 * 18,
-                text.as_ptr(),
-                text.len() as i32,
-            );
-        }
-
-        BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem_dc, 0, 0, SRCCOPY);
-
-        SelectObject(mem_dc, prev_bitmap);
-        DeleteObject(mem_bitmap as _);
-        DeleteDC(mem_dc);
     }
 
-    paint.end_paint(&ps);
+    let transform = camera.get_full_transformation();
+
+    // Sort farthest-to-nearest. Distance keys are precomputed so the comparator does no math,
+    // and camera position is computed once instead of once per comparison.
+    let camera_position = camera.get_position();
+    let mut sorted_indices: Vec<(f64, usize)> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, body)| (body.position.distance_squared(camera_position), i))
+        .collect();
+    sorted_indices.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    app.targets.clear();
+    app.targets.reserve(bodies.len());
+
+    for (_, i) in sorted_indices {
+        let body = &bodies[i];
+        let pos = transform.transform_point3(body.position);
+
+        if pos.z >= 1.0 {
+            continue;
+        }
+
+        let distance_scalar = 1.0 - pos.z;
+
+        // Transfer to screen coordinates
+        let center_x = (pos.x / distance_scalar * screen_scalar + screen_width / 2.0) as f32;
+        let center_y = (screen_height / 2.0 - pos.y / distance_scalar * screen_scalar) as f32;
+
+        let radius_without_mag = body.radius / camera.distance / distance_scalar * screen_scalar;
+        let radius_with_mag = radius_without_mag * body.magnification.cbrt();
+
+        let max_magnification = 10.0;
+        let mut radius = if radius_without_mag < max_magnification {
+            radius_with_mag.min(max_magnification)
+        } else {
+            radius_without_mag
+        };
+        radius = radius.max(3.0);
+
+        let left_x = center_x - radius as f32;
+        let right_x = center_x + radius as f32;
+
+        let top_y = center_y - radius as f32;
+        let bottom_y = center_y + radius as f32;
+
+        if right_x < rect.min.x || bottom_y < rect.min.y || left_x > rect.max.x || top_y > rect.max.y
+        {
+            continue;
+        }
+
+        let [r, g, b] = body.color;
+        painter.add(Shape::circle_filled(
+            Pos2::new(center_x, center_y),
+            radius as f32,
+            Color32::from_rgb(r, g, b),
+        ));
+
+        app.targets.push(TargetData {
+            uuid: body.uuid,
+            x: center_x,
+            y: center_y,
+            radius: radius as f32,
+        });
+    }
+
+    painter.add(Shape::rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(1.0, Color32::from_rgb(100, 100, 255)),
+        egui::StrokeKind::Inside,
+    ));
+
+    let font = FontId::monospace(13.0);
+    let white = Color32::from_rgb(255, 255, 255);
+    let line_height = 16.0f32;
+
+    let use_target_speed = app.engine.params.lock().unwrap().use_target_speed;
+
+    // Status lines in the bottom-left corner. "Bold" lines are drawn twice with a small x offset,
+    // since the monospace font has no separate bold face.
+    let num_lines = app.status_lines.len();
+    let text_start_y = rect.max.y - num_lines as f32 * line_height - 5.0;
+
+    for (i, text_str) in app.status_lines.iter().enumerate() {
+        let mut pos = Pos2::new(rect.min.x + 5.0, text_start_y + i as f32 * line_height);
+
+        if use_target_speed && i == 0 || !use_target_speed && i == 1 {
+            let bold_pos = pos;
+            pos.x += 0.5;
+            painter.text(bold_pos, Align2::LEFT_TOP, text_str, font.clone(), white);
+        }
+
+        painter.text(pos, Align2::LEFT_TOP, text_str, font.clone(), white);
+    }
+
+    for (i, text_str) in app.object_description.iter().enumerate() {
+        let pos = Pos2::new(rect.min.x + 5.0, rect.min.y + 5.0 + i as f32 * line_height);
+        painter.text(pos, Align2::LEFT_TOP, text_str, font.clone(), white);
+    }
 }
 
-pub fn get_status_text(app: &DrawingApp) -> Vec<String> {
+pub fn get_status_text(app: &SolarApp) -> Vec<String> {
     let objects_len = app.engine.objects.lock().unwrap().len();
     let params = app.engine.params.lock().unwrap().clone();
 
@@ -161,18 +215,16 @@ pub fn get_status_text(app: &DrawingApp) -> Vec<String> {
     lines
 }
 
-pub fn get_object_description_text(app: &DrawingApp) -> Vec<String> {
-    let obj;
-    let objects = app.engine.objects.lock().unwrap().clone();
-    if let Some(target) = *app.current_target.borrow() {
-        if let Some(object) = objects.iter().find(|x| x.uuid == target) {
-            obj = object;
-        } else {
-            return vec![];
+pub fn get_object_description_text(app: &SolarApp) -> Vec<String> {
+    let objects = app.engine.objects.lock().unwrap();
+    let obj = if let Some(target) = app.current_target {
+        match objects.iter().find(|x| x.uuid == target) {
+            Some(object) => object,
+            None => return vec![],
         }
     } else {
         return vec![];
-    }
+    };
 
     let mut parent_info: Vec<String> = vec!["".into(), "".into(), "".into()];
     if let Some(parent) = engine::Engine::find_orbital_parent(obj, &objects) {
@@ -224,106 +276,4 @@ pub fn get_object_description_text(app: &DrawingApp) -> Vec<String> {
             obj.acceleration.x, obj.acceleration.y, obj.acceleration.z
         ),
     ]
-}
-
-pub fn get_paint_objects(app: &DrawingApp) -> Vec<(i32, i32, i32, i32, HBRUSH)> {
-    let bodies = app.engine.objects.lock().unwrap().clone();
-    let mut camera = app.camera.lock().unwrap();
-    let mut target_opt = app.current_target.borrow_mut();
-
-    let (screen_width_pix, screen_height_pix) = app.window.size();
-    let screen_scalar = screen_width_pix as f64 / 2.0 / (camera.fov / 2.0).to_radians().tan();
-
-    if let Some(target) = *target_opt {
-        camera.target = match bodies.iter().find(|x| x.uuid == target) {
-            Some(b) => match camera.get_animation_position(b.position, b.radius) {
-                Some((target, distance)) => {
-                    camera.distance = distance;
-
-                    if target == b.position {
-                        camera.animation_start = None;
-                    }
-
-                    target
-                }
-                None => b.position,
-            },
-            None => {
-                *target_opt = None;
-                DVec3::ZERO
-            }
-        }
-    }
-
-    let transform = camera.get_full_transformation();
-
-    let mut output: Vec<(i32, i32, i32, i32, HBRUSH)> = Vec::new();
-
-    let mut sorted_indices: Vec<usize> = (0..bodies.len()).collect();
-    sorted_indices.sort_by(|a, b| bodies[*b].cmp(&bodies[*a], camera.get_position()));
-
-    let mut targets = app.targets.borrow_mut();
-    targets.clear();
-
-    for i in sorted_indices {
-        let body = &bodies[i];
-        let pos = transform.transform_point3(body.position);
-
-        if pos.z >= 1.0 {
-            continue;
-        }
-
-        let distance_scalar = 1.0 - pos.z;
-
-        // Transfer to screen coordinates
-        let center_x = pos.x / distance_scalar * screen_scalar + screen_width_pix as f64 / 2.0;
-        let center_y = screen_height_pix as f64 / 2.0 - pos.y / distance_scalar * screen_scalar;
-
-        let radius_without_mag = body.radius / camera.distance / distance_scalar * screen_scalar;
-        let radius_with_mag = radius_without_mag * body.magnification.powf(3.0_f64.recip());
-
-        let max_magnification = 10.0;
-        let mut radius = if radius_without_mag < max_magnification {
-            radius_with_mag.min(max_magnification)
-        } else {
-            radius_without_mag
-        };
-        radius = radius.max(3.0);
-
-        let left_x = center_x - radius;
-        let right_x = center_x + radius;
-
-        let top_y = center_y - radius;
-        let bottom_y = center_y + radius;
-
-        let res_left_x: i32 = left_x.round() as i32;
-        let res_right_x: i32 = right_x.round() as i32;
-        let res_top_y: i32 = top_y.round() as i32;
-        let res_bottom_y: i32 = bottom_y.round() as i32;
-
-        if res_right_x < 0
-            || res_bottom_y < 0
-            || res_left_x > screen_width_pix as i32
-            || res_top_y > screen_height_pix as i32
-        {
-            continue;
-        }
-
-        let [r, g, b] = body.color;
-        output.push((
-            res_left_x,
-            res_right_x,
-            res_top_y,
-            res_bottom_y,
-            app.get_brush(r, g, b),
-        ));
-        targets.push(TargetData {
-            uuid: body.uuid,
-            x: center_x,
-            y: center_y,
-            radius,
-        });
-    }
-
-    output
 }

@@ -74,8 +74,12 @@ impl Engine {
                 params_local.time_step
             };
 
+            let mut coefficient_table = params_local.method.get_coefficients();
+
             let mut time_running = params_local.time_elapsed;
             let mut time_step_counter: u128 = 0;
+
+            let mut accel_scratch: Vec<DVec3> = Vec::new();
 
             let mut i = 0;
             let mut steps_until_update = 1000u128;
@@ -101,7 +105,6 @@ impl Engine {
                 if params_local.num_threads == 1 || !use_symplectic {
                     let mut objects_local = objects_local.write().unwrap();
                     if use_symplectic {
-                        let coefficient_table = params_local.method.get_coefficients();
                         'outer_integration_loop: while i < steps_until_update {
                             for (c, d) in coefficient_table.iter() {
                                 objects_local.iter_mut().for_each(|x| {
@@ -111,13 +114,16 @@ impl Engine {
                                 // This check speeds up 4th order symplectic integration significantly
                                 if *d != 0.0 {
                                     loop {
-                                        match integration::symplectic(&objects_local) {
-                                            Ok(res) => {
+                                        match integration::symplectic_into(
+                                            &objects_local,
+                                            &mut accel_scratch,
+                                        ) {
+                                            Ok(()) => {
                                                 for (body, vector) in
-                                                    objects_local.iter_mut().zip(res)
+                                                    objects_local.iter_mut().zip(&accel_scratch)
                                                 {
-                                                    body.velocity += time_step * d * vector;
-                                                    body.acceleration = vector;
+                                                    body.velocity += time_step * d * *vector;
+                                                    body.acceleration = *vector;
                                                 }
 
                                                 break;
@@ -172,7 +178,6 @@ impl Engine {
                         }
                     }
                 } else {
-                    let coefficient_table = params_local.method.get_coefficients();
                     'outer_integration_loop: while i < steps_until_update {
                         for (c, d) in coefficient_table.iter() {
                             if *c != 0.0 {
@@ -191,7 +196,9 @@ impl Engine {
                                     let mut objects = objects_local.write().unwrap();
 
                                     // These will hold the final acceleration values
-                                    let mut acceleration_vectors = vec![DVec3::ZERO; objects.len()];
+                                    accel_scratch.clear();
+                                    accel_scratch.resize(objects.len(), DVec3::ZERO);
+                                    let acceleration_vectors = &mut accel_scratch;
 
                                     for lock in results {
                                         let result = lock.lock().unwrap();
@@ -235,11 +242,10 @@ impl Engine {
                                     }
 
                                     // Step was successful (no collisions) so we can update state
-                                    for (object, acc) in
-                                        objects.iter_mut().zip(acceleration_vectors)
+                                    for (object, acc) in objects.iter_mut().zip(&*acceleration_vectors)
                                     {
-                                        object.velocity += time_step * d * acc;
-                                        object.acceleration = acc;
+                                        object.velocity += time_step * d * *acc;
+                                        object.acceleration = *acc;
                                     }
 
                                     break;
@@ -255,8 +261,8 @@ impl Engine {
                     // Update state for UI
                     let objects = objects_local.read().unwrap();
                     let mut objects_shared = objects_shared.lock().unwrap();
-                    objects_shared.clear();
-                    objects.iter().for_each(|o| objects_shared.push(o.clone()));
+                    // clone_from reuses the existing allocations (names, vectors) instead of reallocating every frame
+                    objects_shared.clone_from(&objects);
                 }
 
                 let mut params = params_lock.lock().unwrap();
@@ -317,6 +323,7 @@ impl Engine {
                     }
 
                     params_local = params.clone();
+                    coefficient_table = params_local.method.get_coefficients();
 
                     use_symplectic = match params_local.method {
                         IntegrationMethod::Symplectic(_) => true,
@@ -453,11 +460,12 @@ impl Engine {
         objects: &'a [AstronomicalObject],
     ) -> Option<&'a AstronomicalObject> {
         let allowed_error = 0.1f64;
-        if child.acceleration.length() == 0.0 {
+        let child_acc_len = child.acceleration.length();
+        if child_acc_len == 0.0 {
             return None;
         }
 
-        let child_acc_unit = child.acceleration.clamp_length(1.0, 1.0);
+        let child_acc_unit = child.acceleration / child_acc_len;
 
         for other in objects {
             if std::ptr::eq(child, other) {
@@ -465,14 +473,16 @@ impl Engine {
             }
 
             let difference = other.position - child.position;
+            let difference_len = difference.length();
             let scalar = difference.dot(child_acc_unit);
 
-            if 1.0 - scalar / difference.length() >= allowed_error {
+            if 1.0 - scalar / difference_len >= allowed_error {
                 continue;
             }
 
-            let acc_caused_by_other = G * other.mass / difference.length_squared();
-            if 1.0 - acc_caused_by_other / child.acceleration.length() >= allowed_error {
+            let acc_caused_by_other =
+                G * other.mass / (difference_len * difference_len);
+            if 1.0 - acc_caused_by_other / child_acc_len >= allowed_error {
                 continue;
             }
 

@@ -1,10 +1,9 @@
-use std::cmp::Ordering;
 use std::f64::consts::PI;
 
 use crate::integration::G;
 
 use glam::{DAffine3, DVec3};
-use rand::{rngs::StdRng, Rng};
+use rand::{rngs::StdRng, RngExt};
 use uuid::Uuid;
 
 pub const AU: f64 = 1.495978707E11;
@@ -340,19 +339,6 @@ impl AstronomicalObject {
         system
     }
 
-    pub fn cmp(&self, other: &AstronomicalObject, target: DVec3) -> Ordering {
-        let a = self.position.distance_squared(target);
-        let b = other.position.distance_squared(target);
-
-        if a < b {
-            return Ordering::Less;
-        } else if a > b {
-            return Ordering::Greater;
-        }
-
-        Ordering::Equal
-    }
-
     pub fn place_on_orbit(
         obj: OrbitalObject,
         target: &AstronomicalObject,
@@ -376,12 +362,12 @@ impl AstronomicalObject {
 
         let inclination_angle = match obj.inclination {
             Inclination::Fixed(a) => a,
-            Inclination::Random(a) => rng.gen_range(0.0..=a),
+            Inclination::Random(a) => rng.random_range(0.0..=a),
         };
 
-        let rot_y = DAffine3::from_rotation_y(rng.gen_range(0.0..2.0 * PI));
+        let rot_y = DAffine3::from_rotation_y(rng.random_range(0.0..2.0 * PI));
         let rot_z = DAffine3::from_rotation_z(inclination_angle);
-        let rot_y_2 = DAffine3::from_rotation_y(rng.gen_range(0.0..2.0 * PI));
+        let rot_y_2 = DAffine3::from_rotation_y(rng.random_range(0.0..2.0 * PI));
         let translate_pos = DAffine3::from_translation(target.position);
         let translate_vel = DAffine3::from_translation(target.velocity);
 
@@ -406,22 +392,22 @@ impl AstronomicalObject {
 
     pub fn get_random_planet(rng: &mut StdRng) -> OrbitalObject {
         let density_earth = 5.972168E24 / 6371.0E3f64.powi(3);
-        let mass = rng.gen_range(1.303E22..=6.8982E27);
-        let radius = (mass / density_earth).powf(3.0_f64.recip());
+        let mass = rng.random_range(1.303E22..=6.8982E27);
+        let radius = (mass / density_earth).cbrt();
 
         OrbitalObject {
-            name: rng.gen_range(0..=1000000).to_string(),
+            name: rng.random_range(0..=1000000).to_string(),
             mass,
             radius,
             // positive_y_rotation: rng.gen_bool(0.5),
             positive_y_rotation: true,
-            method: OrbitalMethod::Radius(rng.gen_range(0.5..=20.0) * AU),
+            method: OrbitalMethod::Radius(rng.random_range(0.5..=20.0) * AU),
             inclination: Inclination::Random(30.0f64.to_radians()),
             magnification: 1.0E7,
             color: [
-                rng.gen_range(0..=255),
-                rng.gen_range(0..=255),
-                rng.gen_range(0..=255),
+                rng.random_range(0..=255),
+                rng.random_range(0..=255),
+                rng.random_range(0..=255),
             ],
         }
     }

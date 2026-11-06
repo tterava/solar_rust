@@ -1,169 +1,162 @@
-use std::{sync::atomic::Ordering, time::Instant};
+use std::time::Instant;
 
+use egui::{Key, PointerButton, Response, Ui};
 use rand::SeedableRng;
 
-use crate::{astronomy::AstronomicalObject, input, integration::IntegrationMethod, DrawingApp};
+use crate::astronomy::AstronomicalObject;
+use crate::integration::IntegrationMethod;
+use crate::SolarApp;
 
-pub fn handle_event(app: &DrawingApp, evt: nwg::Event, evt_data: &nwg::EventData) {
-    use nwg::Event as E;
-    use nwg::EventData::OnKey as K;
-    use nwg::EventData::OnMouseWheel as MW;
-    use nwg::MousePressEvent as M;
+pub fn handle_input(app: &mut SolarApp, ui: &Ui, response: &Response) {
+    const CAMERA_SENSITIVITY: f64 = 0.003;
 
-    match evt {
-        E::OnMousePress(M::MousePressRightUp) => app.is_dragging.store(false, Ordering::Relaxed),
-        E::OnMousePress(M::MousePressRightDown) => {
-            app.is_dragging.store(true, Ordering::Relaxed);
-            input::input_listener(app.is_dragging.clone(), app.camera.clone());
-        }
-        E::OnMousePress(M::MousePressLeftDown) => {
-            let (w_x, w_y) = app.window.position();
-            let (m_x, m_y) = winput::Mouse::position().unwrap();
+    // Rotate camera by dragging with the right mouse button
+    if response.dragged_by(PointerButton::Secondary) {
+        let delta = response.drag_delta();
 
-            let (x, y) = (m_x - w_x - 8, m_y - w_y - 31); // Offset x: 8, y: 31 works for Windows 11. TODO: Figure a better way for this
-            let targets = app.targets.borrow();
+        app.camera
+            .set_yaw(app.camera.get_yaw() - delta.x as f64 * CAMERA_SENSITIVITY);
+        app.camera
+            .set_pitch(app.camera.get_pitch() - delta.y as f64 * CAMERA_SENSITIVITY);
+    }
 
-            println!("{}, {}", m_x - w_x, m_y - w_y);
+    // Select an object with left click
+    if response.clicked_by(PointerButton::Primary) {
+        if let Some(pos) = response.interact_pointer_pos() {
+            for target in app.targets.iter().rev() {
+                let dx = pos.x - target.x;
+                let dy = pos.y - target.y;
 
-            for target in targets.iter().rev() {
-                let tx = target.x as i64;
-                let ty = target.y as i64;
-                let r = target.radius as i64;
-
-                if (tx - x as i64).pow(2) + (ty - y as i64).pow(2) <= r.pow(2) {
-                    if app.camera.lock().unwrap().animation_start.is_some() {
+                if dx * dx + dy * dy <= target.radius * target.radius {
+                    if app.camera.animation_start.is_some() {
                         break;
                     }
 
-                    let mut current_target = app.current_target.borrow_mut();
-
-                    if let Some(t) = *current_target {
-                        if target.uuid == t {
-                            break;
-                        }
+                    if app.current_target == Some(target.uuid) {
+                        break;
                     }
 
-                    *current_target = Some(target.uuid);
-                    *app.next_status_update.borrow_mut() = Instant::now();
+                    app.current_target = Some(target.uuid);
+                    app.next_status_update = Instant::now();
 
-                    drop(current_target); // Important! get_paint_objects acquires both of the locks and can cause deadlocks if this is not dropped
+                    let start = app.camera.target;
+                    let start_dis = app.camera.distance;
 
-                    let mut camera = app.camera.lock().unwrap();
-                    let start = camera.target;
-                    let start_dis = camera.distance;
-
-                    camera.start_animation(start, start_dis);
+                    app.camera.start_animation(start, start_dis);
 
                     break;
                 }
             }
         }
-        E::OnMouseWheel => {
-            if let MW(amount) = evt_data {
-                app.zoom(*amount);
-            }
-        }
-        E::OnKeyPress => {
-            if let K(key) = evt_data {
-                match key {
-                    // Numpad +
-                    107 => {
-                        let mut params = app.engine.params.lock().unwrap();
-                        if params.use_target_speed {
-                            params.target_speed *= 1.2;
-                        } else {
-                            params.time_step *= 1.2;
-                        }
-
-                        *app.next_status_update.borrow_mut() = Instant::now();
-                    }
-                    // Numpad -
-                    109 => {
-                        let mut params = app.engine.params.lock().unwrap();
-                        if params.use_target_speed {
-                            params.target_speed /= 1.2;
-                        } else {
-                            params.time_step /= 1.2;
-                        }
-
-                        *app.next_status_update.borrow_mut() = Instant::now();
-                    }
-                    // Space
-                    32 => {
-                        if app.engine.params.lock().unwrap().is_running {
-                            app.engine.stop();
-                        } else {
-                            app.engine.start_mt();
-                        }
-                    }
-                    // Number keys
-                    49..=57 => {
-                        let threads = key - 48;
-                        let mut params = app.engine.params.lock().unwrap();
-
-                        params.num_threads = threads as usize;
-                        *app.next_status_update.borrow_mut() = Instant::now();
-                    }
-                    // q
-                    81 => {
-                        let mut params = app.engine.params.lock().unwrap();
-
-                        params.num_threads = (params.num_threads - 1).max(1);
-                        *app.next_status_update.borrow_mut() = Instant::now();
-                    }
-                    // w
-                    87 => {
-                        let mut params = app.engine.params.lock().unwrap();
-
-                        params.num_threads += 1;
-                        *app.next_status_update.borrow_mut() = Instant::now();
-                    }
-                    // m
-                    77 => {
-                        let mut params = app.engine.params.lock().unwrap();
-                        params.method = match params.method {
-                            IntegrationMethod::Symplectic(n) => {
-                                if n == 4 {
-                                    IntegrationMethod::RK4
-                                } else {
-                                    IntegrationMethod::Symplectic(n + 1)
-                                }
-                            }
-                            IntegrationMethod::RK4 => IntegrationMethod::Symplectic(1),
-                        };
-                        *app.next_status_update.borrow_mut() = Instant::now();
-                    }
-                    // t
-                    82 => {
-                        let params = app.engine.params.lock().unwrap();
-                        if params.is_running {
-                            return;
-                        }
-
-                        let mut objects = app.engine.objects.lock().unwrap();
-                        let mut rng = rand::rngs::StdRng::from_entropy();
-                        let new_object = AstronomicalObject::place_on_orbit(
-                            AstronomicalObject::get_random_planet(&mut rng),
-                            &objects[0],
-                            &mut rng
-                        );
-                        objects.push(new_object);
-                        *app.next_status_update.borrow_mut() = Instant::now();
-                    }
-                    // n
-                    84 => {
-                        let mut params = app.engine.params.lock().unwrap();
-                        params.use_target_speed = !params.use_target_speed;
-                        *app.next_status_update.borrow_mut() = Instant::now();
-                    }
-                    key => {
-                        println!("Key: {}", key)
-                    }
-                }
-            }
-        }
-        _ => {}
     }
 
-    app.canvas.invalidate();
+    // Zoom with mouse wheel
+    if response.contains_pointer() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+
+        if scroll != 0.0 {
+            app.camera.zoom(if scroll > 0.0 { 1 } else { -1 });
+        }
+    }
+
+    // Space: start/stop simulation
+    if ui.input(|i| i.key_pressed(Key::Space)) {
+        if app.engine.params.lock().unwrap().is_running {
+            app.engine.stop();
+        } else {
+            app.engine.start_mt();
+        }
+    }
+
+    // Numpad +: speed up
+    if ui.input(|i| i.key_pressed(Key::Plus)) {
+        let mut params = app.engine.params.lock().unwrap();
+        if params.use_target_speed {
+            params.target_speed *= 1.2;
+        } else {
+            params.time_step *= 1.2;
+        }
+
+        app.next_status_update = Instant::now();
+    }
+
+    // Numpad -: slow down
+    if ui.input(|i| i.key_pressed(Key::Minus)) {
+        let mut params = app.engine.params.lock().unwrap();
+        if params.use_target_speed {
+            params.target_speed /= 1.2;
+        } else {
+            params.time_step /= 1.2;
+        }
+
+        app.next_status_update = Instant::now();
+    }
+
+    // Number keys: set thread count
+    for (threads, key) in (1..=9).zip([
+        Key::Num1,
+        Key::Num2,
+        Key::Num3,
+        Key::Num4,
+        Key::Num5,
+        Key::Num6,
+        Key::Num7,
+        Key::Num8,
+        Key::Num9,
+    ]) {
+        if ui.input(|i| i.key_pressed(key)) {
+            app.engine.params.lock().unwrap().num_threads = threads;
+            app.next_status_update = Instant::now();
+        }
+    }
+
+    // q: fewer threads
+    if ui.input(|i| i.key_pressed(Key::Q)) {
+        let mut params = app.engine.params.lock().unwrap();
+        params.num_threads = (params.num_threads - 1).max(1);
+        app.next_status_update = Instant::now();
+    }
+
+    // w: more threads
+    if ui.input(|i| i.key_pressed(Key::W)) {
+        let mut params = app.engine.params.lock().unwrap();
+        params.num_threads += 1;
+        app.next_status_update = Instant::now();
+    }
+
+    // m: cycle integration method
+    if ui.input(|i| i.key_pressed(Key::M)) {
+        let mut params = app.engine.params.lock().unwrap();
+        params.method = match params.method {
+            IntegrationMethod::Symplectic(n) => {
+                if n == 4 {
+                    IntegrationMethod::RK4
+                } else {
+                    IntegrationMethod::Symplectic(n + 1)
+                }
+            }
+            IntegrationMethod::RK4 => IntegrationMethod::Symplectic(1),
+        };
+        app.next_status_update = Instant::now();
+    }
+
+    // t: add a random planet
+    if ui.input(|i| i.key_pressed(Key::T)) && !app.engine.params.lock().unwrap().is_running {
+        let mut objects = app.engine.objects.lock().unwrap();
+        let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
+        let new_object = AstronomicalObject::place_on_orbit(
+            AstronomicalObject::get_random_planet(&mut rng),
+            &objects[0],
+            &mut rng,
+        );
+        objects.push(new_object);
+        app.next_status_update = Instant::now();
+    }
+
+    // n: toggle target speed mode
+    if ui.input(|i| i.key_pressed(Key::N)) {
+        let mut params = app.engine.params.lock().unwrap();
+        params.use_target_speed = !params.use_target_speed;
+        app.next_status_update = Instant::now();
+    }
 }
