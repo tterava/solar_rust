@@ -4,6 +4,8 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
 
 use solar_rust::astronomy::{Bodies, BodyId};
 use solar_rust::engine::{Snapshot, Status};
+use solar_rust::ephemeris;
+use solar_rust::forces::Physics;
 use solar_rust::integration::IntegrationMethod;
 
 use crate::camera::Camera;
@@ -115,7 +117,7 @@ pub struct Overlay {
 }
 
 /// The status values the user controls directly
-type Controls = (bool, IntegrationMethod, usize, bool, f64);
+type Controls = (bool, IntegrationMethod, Physics, usize, bool, f64);
 
 fn controls(status: &Status) -> Controls {
     let speed_setting = if status.use_target_speed {
@@ -127,6 +129,7 @@ fn controls(status: &Status) -> Controls {
     (
         status.running,
         status.method,
+        status.physics,
         status.threads,
         status.use_target_speed,
         speed_setting,
@@ -208,6 +211,7 @@ fn status_text(status: &Status, body_count: usize) -> Vec<String> {
             format!("Symplectic - {order} order")
         }
         IntegrationMethod::RK4 => "Runge-Kutta 4".into(),
+        IntegrationMethod::Ias15 => "IAS15 - 15th order, adaptive".into(),
     };
 
     let speed = status.target_speed;
@@ -221,29 +225,59 @@ fn status_text(status: &Status, body_count: usize) -> Vec<String> {
         String::new()
     };
 
+    // Adaptive methods choose their own steps, up to the setting
     let step = status.time_step;
-    let step_detail = if step >= 86400.0 {
-        format!("({:.2} d)", step / 86400.0)
-    } else if step >= 3600.0 {
-        format!("({:.2} h)", step / 3600.0)
-    } else if step >= 60.0 {
-        format!("({:.2} m)", step / 60.0)
+    let step_line = if status.method.is_adaptive() {
+        format!(
+            "Max timestep: {step:.3} s {}, average {:.3} s {}",
+            duration_detail(step),
+            status.mean_step,
+            duration_detail(status.mean_step)
+        )
+    } else {
+        format!("Timestep: {step:.3} s {}", duration_detail(step))
+    };
+
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    let physics = format!(
+        "Oblateness (O): {}, relativity (G): {}",
+        on_off(status.physics.oblateness),
+        on_off(status.physics.relativity)
+    );
+
+    // An adaptive method may not be able to keep up with the target
+    let reached = if status.use_target_speed && status.running && status.speed < 0.95 * speed {
+        format!(", reaching {:.1} d/s", status.speed / 86400.0)
     } else {
         String::new()
     };
 
     vec![
-        format!("Target speed: {:.1} d/s {speed_detail}", speed / 86400.0),
-        format!("Timestep: {step:.3} s {step_detail}"),
         format!(
-            "Simulation time: {:.2} y",
-            status.time_elapsed / (86400.0 * 365.0)
+            "Target speed: {:.1} d/s {speed_detail}{reached}",
+            speed / 86400.0
         ),
+        step_line,
+        format!("Date: {} TDB", ephemeris::format_time(status.time_elapsed)),
         format!("Objects: {body_count}"),
         format!("Method: {method}"),
+        physics,
         format!("Threads: {}", status.threads),
         format!("Speed: {:.0} n/s", status.steps_per_second),
     ]
+}
+
+/// "(2.50 h)" and the like for durations over a minute
+fn duration_detail(seconds: f64) -> String {
+    if seconds >= 86400.0 {
+        format!("({:.2} d)", seconds / 86400.0)
+    } else if seconds >= 3600.0 {
+        format!("({:.2} h)", seconds / 3600.0)
+    } else if seconds >= 60.0 {
+        format!("({:.2} min)", seconds / 60.0)
+    } else {
+        String::new()
+    }
 }
 
 fn description_text(bodies: &Bodies, i: usize) -> Vec<String> {

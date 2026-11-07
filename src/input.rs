@@ -84,4 +84,11 @@ pub fn handle_input(app: &mut SolarApp, ui: &Ui, response: &Response) {
     if pressed(Key::T) {
         engine.send(Command::ToggleTargetSpeed);
     }
+    // o / g: toggle the planets' oblateness and general relativity
+    if pressed(Key::O) {
+        engine.send(Command::ToggleOblateness);
+    }
+    if pressed(Key::G) {
+        engine.send(Command::ToggleRelativity);
+    }
 }

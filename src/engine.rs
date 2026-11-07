@@ -7,9 +7,9 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::astronomy::{Bodies, BodyId, Merge, OrbitalObject};
+use crate::ephemeris::format_time;
+use crate::forces::Physics;
 use crate::integration::{IntegrationMethod, Integrator};
-
-const SECONDS_PER_YEAR: f64 = 365.0 * 86400.0;
 
 /// Requests from the UI to the simulation thread
 pub enum Command {
@@ -20,6 +20,8 @@ pub enum Command {
     SetThreads(usize),
     AdjustThreads(isize),
     CycleMethod,
+    ToggleOblateness,
+    ToggleRelativity,
     /// Puts a body on an orbit around `parent`
     AddOrbiting {
         object: OrbitalObject,
@@ -33,6 +35,7 @@ pub enum Command {
 pub struct Status {
     pub running: bool,
     pub method: IntegrationMethod,
+    pub physics: Physics,
     pub threads: usize,
     /// Simulated seconds per step
     pub time_step: f64,
@@ -44,19 +47,26 @@ pub struct Status {
     /// Simulated seconds since the start
     pub time_elapsed: f64,
     pub steps_per_second: f64,
+    /// Average step actually taken in the latest batch
+    pub mean_step: f64,
+    /// Simulated seconds per real second actually reached
+    pub speed: f64,
 }
 
 impl Default for Status {
     fn default() -> Self {
         Status {
             running: false,
-            method: IntegrationMethod::Symplectic(4),
+            method: IntegrationMethod::Ias15,
+            physics: Physics::FULL,
             threads: 1,
-            time_step: 0.01,
+            time_step: 60.0,
             target_speed: 86400.0,
-            use_target_speed: false,
+            use_target_speed: true,
             time_elapsed: 0.0,
             steps_per_second: 0.0,
+            mean_step: 0.0,
+            speed: 0.0,
         }
     }
 }
@@ -86,7 +96,7 @@ impl Engine {
         let (commands, receiver) = mpsc::channel();
 
         let simulation = Simulation {
-            integrator: Integrator::new(status.method, status.threads),
+            integrator: Integrator::new(status.method, status.threads, status.physics),
             bodies,
             status,
             publish_rate,
@@ -170,7 +180,10 @@ impl Simulation {
 
     fn apply(&mut self, command: Command) {
         let Status {
-            method, threads, ..
+            method,
+            threads,
+            physics,
+            ..
         } = self.status;
 
         match command {
@@ -187,11 +200,25 @@ impl Simulation {
             Command::ToggleTargetSpeed => {
                 self.status.use_target_speed = !self.status.use_target_speed
             }
-            Command::SetThreads(n) => self.set_integrator(method, n),
+            Command::SetThreads(n) => self.set_integrator(method, n, physics),
             Command::AdjustThreads(change) => {
-                self.set_integrator(method, threads.saturating_add_signed(change))
+                self.set_integrator(method, threads.saturating_add_signed(change), physics)
             }
-            Command::CycleMethod => self.set_integrator(method.next(), threads),
+            Command::CycleMethod => self.set_integrator(method.next(), threads, physics),
+            Command::ToggleOblateness => {
+                let physics = Physics {
+                    oblateness: !physics.oblateness,
+                    ..physics
+                };
+                self.set_integrator(method, threads, physics)
+            }
+            Command::ToggleRelativity => {
+                let physics = Physics {
+                    relativity: !physics.relativity,
+                    ..physics
+                };
+                self.set_integrator(method, threads, physics)
+            }
             Command::AddOrbiting { object, parent } => {
                 if let Some(parent) = self.bodies.index_of(parent) {
                     self.bodies.push_orbiting(object, parent, &mut self.rng);
@@ -201,31 +228,33 @@ impl Simulation {
         }
     }
 
-    fn set_integrator(&mut self, method: IntegrationMethod, threads: usize) {
+    fn set_integrator(&mut self, method: IntegrationMethod, threads: usize, physics: Physics) {
         let threads = threads.max(1);
+        let current = (self.status.method, self.status.threads, self.status.physics);
 
-        if (method, threads) != (self.status.method, self.status.threads) {
-            self.integrator = Integrator::new(method, threads);
+        if (method, threads, physics) != current {
+            self.integrator = Integrator::new(method, threads, physics);
             self.status.method = method;
             self.status.threads = threads;
+            self.status.physics = physics;
         }
     }
 
     fn run_batch(&mut self) {
         let started = Instant::now();
-        let dt = self.status.time_step;
-        let mut steps = 0;
+        let max_dt = self.status.time_step;
+        let (mut steps, mut advanced) = (0, 0.0);
 
         while steps < self.batch_steps {
-            self.integrator.step(&mut self.bodies, dt, &mut self.merges);
+            // Summed per batch and added to the total once, to avoid accumulating rounding errors
+            advanced += self
+                .integrator
+                .step(&mut self.bodies, max_dt, &mut self.merges);
             steps += 1;
 
             for merge in self.merges.drain(..) {
-                let years = (self.status.time_elapsed + steps as f64 * dt) / SECONDS_PER_YEAR;
-                println!(
-                    "{years:.2} y: {} collided into {}!",
-                    merge.absorbed, merge.into
-                );
+                let time = format_time(self.status.time_elapsed + advanced);
+                println!("{time}: {} collided into {}!", merge.absorbed, merge.into);
             }
 
             if self.bodies.len() < 2 {
@@ -234,8 +263,7 @@ impl Simulation {
             }
         }
 
-        // Added once per batch rather than per step to avoid accumulating rounding errors
-        self.status.time_elapsed += steps as f64 * dt;
+        self.status.time_elapsed += advanced;
 
         let elapsed = started.elapsed().as_secs_f64();
         let steps_per_second = if elapsed > 0.0 {
@@ -247,11 +275,15 @@ impl Simulation {
 
         self.batch_steps = ((steps_per_second / self.publish_rate).round() as u64).max(1);
         self.status.steps_per_second = steps_per_second;
+        self.status.mean_step = advanced / steps as f64;
+        self.status.speed = self.status.mean_step * steps_per_second;
 
+        // Adaptive methods may take shorter steps than the setting, so the time step setting
+        // is a maximum, and the speed is measured from the steps actually taken
         if self.status.use_target_speed {
             self.status.time_step = self.status.target_speed / steps_per_second;
         } else {
-            self.status.target_speed = self.status.time_step * steps_per_second;
+            self.status.target_speed = self.status.speed;
         }
     }
 }

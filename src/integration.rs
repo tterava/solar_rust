@@ -1,32 +1,32 @@
-use std::ops::Range;
-
 use glam::DVec3;
-use rayon::prelude::*;
-use rayon::ThreadPool;
-use wide::f64x4;
 
 use crate::astronomy::{Bodies, Merge};
-
-pub const G: f64 = 6.6743E-11;
-
-/// Indices of two bodies that are touching
-pub type Collision = (usize, usize);
+use crate::forces::{Forces, Physics};
+use crate::ias15::Ias15;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IntegrationMethod {
     /// Symplectic integrator of order 1-4
     Symplectic(u8),
     RK4,
+    /// 15th order adaptive step integrator, accurate to the limits of double precision
+    Ias15,
 }
 
 impl IntegrationMethod {
-    /// Next method in the cycle: Symplectic 1 -> 2 -> 3 -> 4 -> RK4 -> Symplectic 1
+    /// Next method in the cycle: Symplectic 1 -> 2 -> 3 -> 4 -> RK4 -> IAS15 -> Symplectic 1
     pub fn next(self) -> Self {
         match self {
             IntegrationMethod::Symplectic(n) if n < 4 => IntegrationMethod::Symplectic(n + 1),
             IntegrationMethod::Symplectic(_) => IntegrationMethod::RK4,
-            IntegrationMethod::RK4 => IntegrationMethod::Symplectic(1),
+            IntegrationMethod::RK4 => IntegrationMethod::Ias15,
+            IntegrationMethod::Ias15 => IntegrationMethod::Symplectic(1),
         }
+    }
+
+    /// Whether the method chooses its own time steps
+    pub fn is_adaptive(self) -> bool {
+        self == IntegrationMethod::Ias15
     }
 
     /// (c, d) coefficients for the symplectic integrator:
@@ -62,24 +62,31 @@ pub struct Integrator {
     coefficients: Vec<(f64, f64)>,
     forces: Forces,
     rk4: Rk4Scratch,
+    ias15: Ias15,
 }
 
 impl Integrator {
-    pub fn new(method: IntegrationMethod, threads: usize) -> Self {
+    pub fn new(method: IntegrationMethod, threads: usize, physics: Physics) -> Self {
         Integrator {
             method,
             coefficients: method.coefficients(),
-            forces: Forces::new(threads),
+            forces: Forces::new(threads, physics),
             rk4: Rk4Scratch::default(),
+            ias15: Ias15::default(),
         }
     }
 
     /// Advances one time step. Collisions are resolved by merging the bodies, and reported in `merges`.
-    pub fn step(&mut self, bodies: &mut Bodies, dt: f64, merges: &mut Vec<Merge>) {
+    /// Returns the time step taken: `max_dt` for fixed step methods, at most that for adaptive ones.
+    pub fn step(&mut self, bodies: &mut Bodies, max_dt: f64, merges: &mut Vec<Merge>) -> f64 {
         match self.method {
-            IntegrationMethod::Symplectic(_) => self.symplectic_step(bodies, dt, merges),
-            IntegrationMethod::RK4 => self.rk4_step(bodies, dt, merges),
+            IntegrationMethod::Symplectic(_) => self.symplectic_step(bodies, max_dt, merges),
+            IntegrationMethod::RK4 => self.rk4_step(bodies, max_dt, merges),
+            IntegrationMethod::Ias15 => {
+                return self.ias15.step(&mut self.forces, bodies, max_dt, merges);
+            }
         }
+        max_dt
     }
 
     fn symplectic_step(&mut self, bodies: &mut Bodies, dt: f64, merges: &mut Vec<Merge>) {
@@ -107,20 +114,17 @@ impl Integrator {
         // k2 = (v + a1 * dt/2, a(x + v * dt/2))
         offset(&mut s.pos, x, v, half);
         offset(&mut s.v2, v, a, half);
-        self.forces
-            .compute(&s.pos, &bodies.mass, &bodies.radius, &mut s.a2);
+        self.forces.compute(bodies, &s.pos, &s.v2, &mut s.a2);
 
         // k3 = (v + a2 * dt/2, a(x + v2 * dt/2))
         offset(&mut s.pos, x, &s.v2, half);
         offset(&mut s.v3, v, &s.a2, half);
-        self.forces
-            .compute(&s.pos, &bodies.mass, &bodies.radius, &mut s.a3);
+        self.forces.compute(bodies, &s.pos, &s.v3, &mut s.a3);
 
         // k4 = (v + a3 * dt, a(x + v3 * dt))
         offset(&mut s.pos, x, &s.v3, dt);
         offset(&mut s.v4, v, &s.a3, dt);
-        self.forces
-            .compute(&s.pos, &bodies.mass, &bodies.radius, &mut s.a4);
+        self.forces.compute(bodies, &s.pos, &s.v4, &mut s.a4);
 
         for i in 0..bodies.len() {
             let dxdt = (bodies.velocity[i] + 2.0 * (s.v2[i] + s.v3[i]) + s.v4[i]) / 6.0;
@@ -162,7 +166,7 @@ impl Rk4Scratch {
 }
 
 /// target[i] += delta[i] * scale
-fn add_scaled(target: &mut [DVec3], delta: &[DVec3], scale: f64) {
+pub(crate) fn add_scaled(target: &mut [DVec3], delta: &[DVec3], scale: f64) {
     for (t, d) in target.iter_mut().zip(delta) {
         *t += *d * scale;
     }
@@ -175,361 +179,17 @@ fn offset(out: &mut [DVec3], base: &[DVec3], delta: &[DVec3], scale: f64) {
     }
 }
 
-/// Gravitational force evaluation, either on the calling thread or spread over a thread pool
-struct Forces {
-    pool: Option<ThreadPool>,
-    input: KernelInput,
-    /// One acceleration buffer per thread, summed after each evaluation
-    partials: Vec<Columns>,
-}
-
-impl Forces {
-    fn new(threads: usize) -> Self {
-        let pool = (threads > 1).then(|| {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .expect("Failed to create thread pool")
-        });
-
-        Forces {
-            pool,
-            input: KernelInput::default(),
-            partials: Vec::new(),
-        }
-    }
-
-    /// Updates `bodies.acceleration`, first merging any bodies that are touching
-    fn update_with_merges(&mut self, bodies: &mut Bodies, merges: &mut Vec<Merge>) {
-        while let Some((i, j)) = self.compute(
-            &bodies.position,
-            &bodies.mass,
-            &bodies.radius,
-            &mut bodies.acceleration,
-        ) {
-            merges.push(bodies.merge(i, j));
-        }
-    }
-
-    /// Writes the acceleration of every body into `acc` and returns a touching pair, if any.
-    fn compute(
-        &mut self,
-        pos: &[DVec3],
-        mass: &[f64],
-        radius: &[f64],
-        acc: &mut [DVec3],
-    ) -> Option<Collision> {
-        let n = pos.len();
-        self.input.load(pos, mass, radius);
-        let input = &self.input;
-
-        match &self.pool {
-            None => {
-                self.partials.resize_with(1, Columns::default);
-                let collision = accumulate_pairs(0..n, input, &mut self.partials[0]);
-                sum_partials(&self.partials, 0, acc);
-                collision
-            }
-            Some(pool) => pool.install(|| {
-                // Each thread takes a block of rows with an equal share of the pairs, and adds
-                // into its own buffer, since a pair also writes to the other body's row.
-                let blocks = balanced_row_blocks(n, pool.current_num_threads());
-                self.partials.resize_with(blocks.len(), Columns::default);
-
-                let collision = self
-                    .partials
-                    .par_iter_mut()
-                    .zip(blocks)
-                    .filter_map(|(partial, rows)| accumulate_pairs(rows, input, partial))
-                    .min(); // The first pair in row order, same as single-threaded
-
-                // The buffers are summed in parallel too: they're in other cores' caches,
-                // which makes this slow enough to matter on one thread
-                const CHUNK: usize = 64;
-                let partials = &self.partials;
-                acc.par_chunks_mut(CHUNK)
-                    .enumerate()
-                    .for_each(|(c, chunk)| sum_partials(partials, c * CHUNK, chunk));
-
-                collision
-            }),
-        }
-    }
-}
-
-/// acc[k] = G * the sum of the partial accelerations of body `first + k`.
-/// G is applied once per body instead of once per pair.
-fn sum_partials(partials: &[Columns], first: usize, acc: &mut [DVec3]) {
-    for (i, a) in (first..).zip(acc) {
-        *a = G * partials.iter().map(|p| p.get(i)).sum::<DVec3>();
-    }
-}
-
-/// Bodies per SIMD register
-const LANES: usize = 4;
-
-/// One array per vector component, so the values of 4 neighbouring bodies load straight
-/// into a SIMD register.
-#[derive(Default)]
-struct Columns {
-    x: Vec<f64>,
-    y: Vec<f64>,
-    z: Vec<f64>,
-}
-
-impl Columns {
-    fn get(&self, i: usize) -> DVec3 {
-        DVec3::new(self.x[i], self.y[i], self.z[i])
-    }
-
-    fn fill(&mut self, len: usize, value: f64) {
-        for column in [&mut self.x, &mut self.y, &mut self.z] {
-            column.clear();
-            column.resize(len, value);
-        }
-    }
-}
-
-/// The kernel's copy of the bodies, padded with dummy bodies up to a whole SIMD register past
-/// the last one, so every row can be processed in whole chunks of [`LANES`]. The dummies are
-/// massless and so far away that their pull comes out as exactly 0, and they never touch anything.
-#[derive(Default)]
-struct KernelInput {
-    len: usize,
-    pos: Columns,
-    mass: Vec<f64>,
-    radius: Vec<f64>,
-}
-
-impl KernelInput {
-    fn load(&mut self, pos: &[DVec3], mass: &[f64], radius: &[f64]) {
-        let padded = pos.len() + LANES - 1;
-        self.len = pos.len();
-
-        self.pos.fill(padded, f64::MAX);
-        for (i, p) in pos.iter().enumerate() {
-            (self.pos.x[i], self.pos.y[i], self.pos.z[i]) = (p.x, p.y, p.z);
-        }
-        for (column, values) in [(&mut self.mass, mass), (&mut self.radius, radius)] {
-            column.clear();
-            column.extend_from_slice(values);
-            column.resize(padded, 0.0);
-        }
-    }
-}
-
-fn load(column: &[f64], j: usize) -> f64x4 {
-    f64x4::new(column[j..j + LANES].try_into().unwrap())
-}
-
-/// column[j..j + 4] -= value
-fn subtract(column: &mut [f64], j: usize, value: f64x4) {
-    let lanes: &mut [f64; LANES] = (&mut column[j..j + LANES]).try_into().unwrap();
-    *lanes = (f64x4::new(*lanes) - value).to_array();
-}
-
-/// Adds the pull between body i and every later body j, for i in `rows`, into `acc`
-/// (without the factor G). Each pair is visited once and applied to both bodies
-/// (Newton's 3rd law), 4 pairs at a time. Returns the first touching pair found.
-fn accumulate_pairs(
-    rows: Range<usize>,
-    input: &KernelInput,
-    acc: &mut Columns,
-) -> Option<Collision> {
-    let KernelInput {
-        len: n,
-        ref pos,
-        ref mass,
-        ref radius,
-    } = *input;
-    acc.fill(mass.len(), 0.0);
-    let mut collision = None;
-
-    for i in rows {
-        let (x_i, y_i, z_i) = (
-            f64x4::splat(pos.x[i]),
-            f64x4::splat(pos.y[i]),
-            f64x4::splat(pos.z[i]),
-        );
-        let (mass_i, radius_i) = (f64x4::splat(mass[i]), f64x4::splat(radius[i]));
-        // Body i's sums are kept in registers, one partial sum per lane
-        let (mut ax_i, mut ay_i, mut az_i) = (f64x4::ZERO, f64x4::ZERO, f64x4::ZERO);
-
-        for j in (i + 1..n).step_by(LANES) {
-            let dx = load(&pos.x, j) - x_i;
-            let dy = load(&pos.y, j) - y_i;
-            let dz = load(&pos.z, j) - z_i;
-            let distance_sq = dx * dx + dy * dy + dz * dz;
-
-            if collision.is_none() {
-                let touching_distance = load(radius, j) + radius_i;
-                let touching = distance_sq.simd_le(touching_distance * touching_distance);
-                if touching.any() {
-                    collision = Some((i, j + touching.to_bitmask().trailing_zeros() as usize));
-                }
-            }
-
-            // difference / distance^3 = unit vector / distance^2
-            let inv_distance_cubed = f64x4::ONE / (distance_sq * distance_sq.sqrt());
-            let (px, py, pz) = (
-                dx * inv_distance_cubed,
-                dy * inv_distance_cubed,
-                dz * inv_distance_cubed,
-            );
-
-            let mass_j = load(mass, j);
-            ax_i += px * mass_j;
-            ay_i += py * mass_j;
-            az_i += pz * mass_j;
-
-            subtract(&mut acc.x, j, px * mass_i);
-            subtract(&mut acc.y, j, py * mass_i);
-            subtract(&mut acc.z, j, pz * mass_i);
-        }
-
-        acc.x[i] += ax_i.reduce_add();
-        acc.y[i] += ay_i.reduce_add();
-        acc.z[i] += az_i.reduce_add();
-    }
-
-    collision
-}
-
-/// Splits rows 0..n into at most `blocks` contiguous ranges with roughly the same number of
-/// pairs each. Row i has n - 1 - i pairs, so early blocks get fewer rows than late ones.
-fn balanced_row_blocks(n: usize, blocks: usize) -> Vec<Range<usize>> {
-    let total_pairs = n * n.saturating_sub(1) / 2;
-    let mut ranges = Vec::with_capacity(blocks);
-    let (mut start, mut pairs) = (0, 0);
-
-    for i in 0..n {
-        pairs += n - 1 - i;
-        if pairs * blocks >= total_pairs * (ranges.len() + 1) {
-            ranges.push(start..i + 1);
-            start = i + 1;
-        }
-    }
-    if start < n {
-        ranges.push(start..n);
-    }
-
-    ranges
-}
-
 #[cfg(test)]
 mod tests {
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
 
     use super::*;
-    use crate::astronomy::{solar_system, OrbitalObject};
-
-    fn test_system(extra_planets: usize) -> Bodies {
-        let mut rng = StdRng::seed_from_u64(7);
-        let mut bodies = solar_system(&mut rng);
-        for _ in 0..extra_planets {
-            bodies.push_orbiting(OrbitalObject::random_planet(&mut rng), 0, &mut rng);
-        }
-        bodies
-    }
-
-    /// Straight from Newton's law of gravitation, one body at a time
-    fn reference_accelerations(bodies: &Bodies) -> Vec<DVec3> {
-        (0..bodies.len())
-            .map(|i| {
-                (0..bodies.len())
-                    .filter(|&j| j != i)
-                    .map(|j| {
-                        let difference = bodies.position[j] - bodies.position[i];
-                        G * bodies.mass[j] * difference / difference.length().powi(3)
-                    })
-                    .sum()
-            })
-            .collect()
-    }
-
-    /// Covers every body count modulo the SIMD width, to exercise the padding
-    #[test]
-    fn forces_match_reference() {
-        for extra in [0, 1, 2, 3, 200] {
-            let bodies = test_system(extra);
-            let expected = reference_accelerations(&bodies);
-
-            for threads in [1, 3] {
-                let mut acc = vec![DVec3::ZERO; bodies.len()];
-                let collision = Forces::new(threads).compute(
-                    &bodies.position,
-                    &bodies.mass,
-                    &bodies.radius,
-                    &mut acc,
-                );
-                assert_eq!(collision, None);
-
-                for (i, (a, e)) in acc.iter().zip(&expected).enumerate() {
-                    assert!(
-                        (*a - *e).length() <= 1e-9 * e.length(),
-                        "n={}, threads={threads}, body {i}: {a} vs {e}",
-                        bodies.len()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn parallel_forces_match_pairwise() {
-        let bodies = test_system(200);
-        let n = bodies.len();
-        let (mut serial, mut parallel) = (vec![DVec3::ZERO; n], vec![DVec3::ZERO; n]);
-
-        Forces::new(1).compute(&bodies.position, &bodies.mass, &bodies.radius, &mut serial);
-        Forces::new(4).compute(
-            &bodies.position,
-            &bodies.mass,
-            &bodies.radius,
-            &mut parallel,
-        );
-
-        for (s, p) in serial.iter().zip(&parallel) {
-            assert!((*s - *p).length() <= 1e-9 * s.length(), "{s} vs {p}");
-        }
-    }
-
-    #[test]
-    fn row_blocks_cover_every_row_once() {
-        for n in [0, 1, 2, 3, 13, 100, 1000] {
-            for blocks in [1, 2, 3, 12] {
-                let ranges = balanced_row_blocks(n, blocks);
-                let rows: Vec<usize> = ranges.iter().flat_map(|r| r.clone()).collect();
-                assert_eq!(rows, (0..n).collect::<Vec<_>>(), "n={n}, blocks={blocks}");
-            }
-        }
-    }
-
-    #[test]
-    fn collisions_found_by_both_kernels() {
-        // Put a body on top of the Earth (3). Earth's row starts at 4, so 4..=8 covers every
-        // SIMD lane and the start of the next register.
-        for other in 4..=8 {
-            let mut bodies = test_system(0);
-            bodies.position[other] = bodies.position[3];
-
-            for threads in [1, 4] {
-                let mut acc = vec![DVec3::ZERO; bodies.len()];
-                let found = Forces::new(threads).compute(
-                    &bodies.position,
-                    &bodies.mass,
-                    &bodies.radius,
-                    &mut acc,
-                );
-                assert_eq!(found, Some((3, other)), "threads = {threads}");
-            }
-        }
-    }
+    use crate::astronomy::{NewBody, OrbitalObject, AU};
+    use crate::ephemeris::solar_system;
 
     #[test]
     fn merge_conserves_mass_and_momentum() {
-        let mut bodies = test_system(0);
+        let mut bodies = solar_system();
         let total_mass: f64 = bodies.mass.iter().sum();
         let momentum =
             |b: &Bodies| -> DVec3 { b.velocity.iter().zip(&b.mass).map(|(v, m)| *v * *m).sum() };
@@ -547,10 +207,8 @@ mod tests {
     /// on every method and thread count
     #[test]
     fn earth_completes_an_orbit() {
-        use crate::astronomy::{NewBody, AU, SOLAR_MASS, SOLAR_RADIUS};
-
         let year: f64 = 365.256 * 86400.0;
-        let dt = 3600.0;
+        let dt: f64 = 3600.0;
 
         for method in [
             IntegrationMethod::Symplectic(1),
@@ -558,16 +216,18 @@ mod tests {
             IntegrationMethod::Symplectic(3),
             IntegrationMethod::Symplectic(4),
             IntegrationMethod::RK4,
+            IntegrationMethod::Ias15,
         ] {
             for threads in [1, 2] {
-                let mut rng = StdRng::seed_from_u64(1);
+                let mut rng = rand::rngs::StdRng::seed_from_u64(1);
                 let mut bodies = Bodies::default();
                 let sun = bodies.push(NewBody {
                     name: "Sun".into(),
-                    mass: SOLAR_MASS,
-                    radius: SOLAR_RADIUS,
+                    mass: 1.98847E30,
+                    radius: 6.957E8,
                     position: DVec3::ZERO,
                     velocity: DVec3::ZERO,
+                    oblateness: None,
                     magnification: 1.0,
                     color: [0; 3],
                 });
@@ -576,11 +236,12 @@ mod tests {
                 bodies.push_orbiting(earth, sun, &mut rng);
 
                 let start = bodies.position[1] - bodies.position[0];
-                let mut integrator = Integrator::new(method, threads);
+                let mut integrator = Integrator::new(method, threads, Physics::NEWTONIAN);
                 let mut merges = Vec::new();
 
-                for _ in 0..(year / dt).round() as usize {
-                    integrator.step(&mut bodies, dt, &mut merges);
+                let mut time = 0.0;
+                while time < year {
+                    time += integrator.step(&mut bodies, dt.min(year - time), &mut merges);
                 }
 
                 let end = bodies.position[1] - bodies.position[0];
@@ -592,5 +253,56 @@ mod tests {
                 assert!(merges.is_empty());
             }
         }
+    }
+
+    /// Two equal masses on a circular orbit in a strong field (GM / (r c^2) = 10^-3). With
+    /// relativity, a circular orbit needs the post-Newtonian angular velocity
+    /// w^2 = GM / r^3 * (1 - (3 - eta) GM / (r c^2)), eta = m1 m2 / M^2 (harmonic coordinates).
+    /// Started with it the separation stays constant; started with the Newtonian one it doesn't.
+    #[test]
+    fn relativistic_binary_stays_circular() {
+        use crate::forces::{C, G};
+
+        let gm: f64 = 1.0E20;
+        let strength = 1.0E-3;
+        let separation = gm / (C * C * strength);
+        let newtonian_w = (gm / separation.powi(3)).sqrt();
+        let relativistic_w = newtonian_w * (1.0 - (3.0 - 0.25) * strength).sqrt();
+
+        let max_deviation = |w: f64| -> f64 {
+            let mut bodies = Bodies::default();
+            for side in [1.0, -1.0] {
+                bodies.push(NewBody {
+                    name: String::new(),
+                    mass: gm / 2.0 / G,
+                    radius: 1.0,
+                    position: DVec3::new(side * separation / 2.0, 0.0, 0.0),
+                    velocity: DVec3::new(0.0, side * w * separation / 2.0, 0.0),
+                    oblateness: None,
+                    magnification: 1.0,
+                    color: [0; 3],
+                });
+            }
+            let physics = Physics {
+                oblateness: false,
+                relativity: true,
+            };
+            let mut integrator = Integrator::new(IntegrationMethod::Ias15, 1, physics);
+            let period = 2.0 * std::f64::consts::PI / w;
+
+            let (mut time, mut deviation, mut merges) = (0.0, 0.0f64, Vec::new());
+            while time < 5.0 * period {
+                time += integrator.step(&mut bodies, period / 50.0, &mut merges);
+                let r = bodies.position[0].distance(bodies.position[1]);
+                deviation = deviation.max((r / separation - 1.0).abs());
+            }
+            deviation
+        };
+
+        let relativistic = max_deviation(relativistic_w);
+        let newtonian = max_deviation(newtonian_w);
+        // What's left is the second order term, about 9 (GM / (r c^2))^2 = 9e-6
+        assert!(relativistic < 3e-5, "{relativistic}");
+        assert!(newtonian > 1e-3, "{newtonian}");
     }
 }

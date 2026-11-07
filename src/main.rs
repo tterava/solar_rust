@@ -5,10 +5,9 @@ mod ui;
 use std::time::Duration;
 
 use eframe::egui;
-use rand::SeedableRng;
-
-use solar_rust::astronomy::{self, BodyId};
+use solar_rust::astronomy::BodyId;
 use solar_rust::engine::{Engine, Snapshot, Status};
+use solar_rust::ephemeris;
 
 use crate::camera::Camera;
 
@@ -28,8 +27,7 @@ pub struct SolarApp {
 
 impl SolarApp {
     fn new() -> Self {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let bodies = astronomy::solar_system(&mut rng);
+        let bodies = ephemeris::solar_system();
 
         SolarApp {
             engine: Engine::new(bodies, Status::default(), PUBLISH_RATE),

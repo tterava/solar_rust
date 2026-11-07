@@ -4,11 +4,9 @@ use std::sync::Arc;
 use glam::{DAffine3, DVec3};
 use rand::{Rng, RngExt};
 
-use crate::integration::G;
+use crate::forces::G;
 
 pub const AU: f64 = 1.495978707E11;
-pub const SOLAR_MASS: f64 = 1.98847E30;
-pub const SOLAR_RADIUS: f64 = 6.957E8;
 
 /// Stable identity for a body. Indices shift when bodies merge, ids don't.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -31,8 +29,60 @@ pub struct NewBody {
     pub radius: f64,
     pub position: DVec3,
     pub velocity: DVec3,
+    pub oblateness: Option<Oblateness>,
     pub magnification: f64,
     pub color: [u8; 3],
+}
+
+/// Zonal gravity harmonics of a flattened, spinning body. Its equatorial bulge pulls a little
+/// harder than a point mass would near the equator, which makes close orbits precess.
+/// Only the axially symmetric (zonal) terms J2, J4 and J6 are included.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Oblateness {
+    /// Reference radius the coefficients are defined for, m
+    pub radius: f64,
+    /// J2, J4, J6
+    pub j: [f64; 3],
+    /// North pole direction, unit vector
+    pub pole: DVec3,
+}
+
+impl Oblateness {
+    /// Extra acceleration (on top of the point mass pull) of a body at `r` from the oblate
+    /// body's center, for the oblate body's gravitational parameter `gm`.
+    pub fn acceleration(&self, gm: f64, r: DVec3) -> DVec3 {
+        // Gradient of the zonal potential -GM / r * J_n (R/r)^n P_n(s), where s is the sine of
+        // the latitude and P_n the Legendre polynomials:
+        // a = GM / r^2 * J_n (R/r)^n * [((n + 1) P_n(s) + s P_n'(s)) r_unit - P_n'(s) pole]
+        let distance = r.length();
+        let unit = r / distance;
+        let s = unit.dot(self.pole);
+        let ratio = self.radius / distance;
+
+        // P_n(s) and P_n'(s), starting from degree 0 and 1
+        let (mut p_previous, mut p) = (1.0, s);
+        let (mut dp_previous, mut dp) = (0.0, 1.0);
+        let mut ratio_n = ratio;
+        let mut sum = DVec3::ZERO;
+
+        for n in 1..6 {
+            // Bonnet's recursion for degree n + 1
+            let n_f = n as f64;
+            let p_next = ((2.0 * n_f + 1.0) * s * p - n_f * p_previous) / (n_f + 1.0);
+            let dp_next = dp_previous + (2.0 * n_f + 1.0) * p;
+            (p_previous, p) = (p, p_next);
+            (dp_previous, dp) = (dp, dp_next);
+            ratio_n *= ratio;
+
+            let degree = n + 1;
+            if degree % 2 == 0 {
+                let j = self.j[degree / 2 - 1];
+                sum += j * ratio_n * (((degree + 1) as f64 * p + s * dp) * unit - dp * self.pole);
+            }
+        }
+
+        sum * (gm / (distance * distance))
+    }
 }
 
 /// Result of two bodies colliding: `absorbed` merged into `into`.
@@ -54,6 +104,7 @@ pub struct Bodies {
     pub acceleration: Vec<DVec3>,
     pub mass: Vec<f64>,
     pub radius: Vec<f64>,
+    pub oblateness: Vec<Option<Oblateness>>,
     pub info: Vec<BodyInfo>,
     next_id: u64,
 }
@@ -77,6 +128,7 @@ impl Bodies {
         self.acceleration.push(DVec3::ZERO);
         self.mass.push(body.mass);
         self.radius.push(body.radius);
+        self.oblateness.push(body.oblateness);
         self.info.push(BodyInfo {
             id,
             name: body.name.into(),
@@ -134,12 +186,13 @@ impl Bodies {
         merge
     }
 
-    fn remove(&mut self, i: usize) {
+    pub fn remove(&mut self, i: usize) {
         self.position.remove(i);
         self.velocity.remove(i);
         self.acceleration.remove(i);
         self.mass.remove(i);
         self.radius.remove(i);
+        self.oblateness.remove(i);
         self.info.remove(i);
     }
 
@@ -182,6 +235,7 @@ impl Clone for Bodies {
         self.acceleration.clone_from(&source.acceleration);
         self.mass.clone_from(&source.mass);
         self.radius.clone_from(&source.radius);
+        self.oblateness.clone_from(&source.oblateness);
         self.info.clone_from(&source.info);
         self.next_id = source.next_id;
     }
@@ -202,7 +256,8 @@ pub struct OrbitalObject {
     pub name: String,
     pub mass: f64,
     pub radius: f64,
-    pub positive_y_rotation: bool,
+    /// Orbits counterclockwise seen from the north (+z), like the planets
+    pub prograde: bool,
     pub method: OrbitalMethod,
     pub inclination: Inclination,
     pub magnification: f64,
@@ -224,7 +279,7 @@ impl OrbitalObject {
             name: name.to_string(),
             mass,
             radius,
-            positive_y_rotation: true,
+            prograde: true,
             method: OrbitalMethod::Radius(orbit_radius),
             inclination: Inclination::Fixed(inclination_deg.to_radians()),
             magnification,
@@ -241,7 +296,7 @@ impl OrbitalObject {
             name: rng.random_range(0..=1000000).to_string(),
             mass,
             radius,
-            positive_y_rotation: true,
+            prograde: true,
             method: OrbitalMethod::Radius(rng.random_range(0.5..=20.0) * AU),
             inclination: Inclination::Random(30.0f64.to_radians()),
             magnification: 1.0E7,
@@ -266,7 +321,7 @@ impl OrbitalObject {
             OrbitalMethod::Speed(v) => (v, G * parent_mass / v.powi(2)),
         };
 
-        if !self.positive_y_rotation {
+        if !self.prograde {
             speed *= -1.0;
         }
 
@@ -275,59 +330,73 @@ impl OrbitalObject {
             Inclination::Random(a) => rng.random_range(0.0..=a),
         };
 
-        let rot_y = DAffine3::from_rotation_y(rng.random_range(0.0..2.0 * PI));
-        let rot_z = DAffine3::from_rotation_z(inclination_angle);
-        let rot_y_2 = DAffine3::from_rotation_y(rng.random_range(0.0..2.0 * PI));
-        let rotation = rot_y_2 * rot_z * rot_y;
+        // Start in the x-y (ecliptic) plane, tilt by the inclination, and turn to a random
+        // direction both before and after tilting
+        let rotation = DAffine3::from_rotation_z(rng.random_range(0.0..2.0 * PI))
+            * DAffine3::from_rotation_x(inclination_angle)
+            * DAffine3::from_rotation_z(rng.random_range(0.0..2.0 * PI));
 
         NewBody {
             name: self.name,
             mass: self.mass,
             radius: self.radius,
-            position: parent_position + rotation.transform_vector3(DVec3::new(0.0, 0.0, radius)),
-            velocity: parent_velocity + rotation.transform_vector3(DVec3::new(speed, 0.0, 0.0)),
+            position: parent_position + rotation.transform_vector3(DVec3::new(radius, 0.0, 0.0)),
+            velocity: parent_velocity + rotation.transform_vector3(DVec3::new(0.0, speed, 0.0)),
+            oblateness: None,
             magnification: self.magnification,
             color: self.color,
         }
     }
 }
 
-/// The solar system with major planets, a few moons, Pluto and the ISS.
-pub fn solar_system(rng: &mut impl Rng) -> Bodies {
-    let mut bodies = Bodies::default();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let sun = bodies.push(NewBody {
-        name: "Sun".to_string(),
-        mass: SOLAR_MASS,
-        radius: SOLAR_RADIUS,
-        position: DVec3::ZERO,
-        velocity: DVec3::ZERO,
-        magnification: 100.0,
-        color: [255, 255, 0],
-    });
-    add_orbiting_bodies(&mut bodies, sun, rng);
+    /// The acceleration should be the gradient of the zonal potential
+    #[test]
+    fn oblateness_is_gradient_of_potential() {
+        let shape = Oblateness {
+            radius: 7.0E7,
+            j: [1.5E-2, -6.0E-4, 3.0E-5],
+            pole: DVec3::new(0.2, -0.3, 0.9).normalize(),
+        };
+        let gm = 1.27E17;
+        let legendre = [
+            |s: f64| (3.0 * s * s - 1.0) / 2.0,
+            |s: f64| (35.0 * s.powi(4) - 30.0 * s * s + 3.0) / 8.0,
+            |s: f64| (231.0 * s.powi(6) - 315.0 * s.powi(4) + 105.0 * s * s - 5.0) / 16.0,
+        ];
+        let potential = |r: DVec3| -> f64 {
+            let (distance, s) = (r.length(), r.normalize().dot(shape.pole));
+            (0..3)
+                .map(|k| {
+                    let n = 2 * k as i32 + 2;
+                    -gm / distance * shape.j[k] * (shape.radius / distance).powi(n) * legendre[k](s)
+                })
+                .sum()
+        };
 
-    bodies
-}
+        for r in [
+            DVec3::new(4.2E8, 1.0E7, -3.0E7),
+            DVec3::new(-1.0E8, 5.0E7, 9.0E7),
+            DVec3::new(2.0E7, 3.0E7, 8.0E7),
+        ] {
+            let h = 1.0;
+            let gradient = DVec3::new(
+                potential(r + DVec3::X * h) - potential(r - DVec3::X * h),
+                potential(r + DVec3::Y * h) - potential(r - DVec3::Y * h),
+                potential(r + DVec3::Z * h) - potential(r - DVec3::Z * h),
+            ) / (2.0 * h);
+            let a = shape.acceleration(gm, r);
+            assert!(
+                (a - gradient).length() <= 1e-6 * a.length(),
+                "{a} vs {gradient}"
+            );
+        }
 
-/// name, mass (kg), radius (m), orbit radius (m), inclination (degrees), magnification, color.
-/// The order matters: each placement consumes random numbers for the orbit orientation.
-#[rustfmt::skip]
-fn add_orbiting_bodies(bodies: &mut Bodies, sun: usize, rng: &mut impl Rng) {
-    use OrbitalObject as O;
-
-    bodies.push_orbiting(O::circular("Mercury", 3.3011E23, 2439.7E3, 0.387098 * AU, 7.005, 2.0E7, [255, 0, 0]), sun, rng);
-    bodies.push_orbiting(O::circular("Venus", 4.8675E24, 6051.8E3, 0.723332 * AU, 3.39458, 2.0E7, [0, 255, 0]), sun, rng);
-    let earth = bodies.push_orbiting(O::circular("Earth", 5.972168E24, 6371.0E3, AU, 0.0, 1.0E7, [0, 0, 255]), sun, rng);
-    bodies.push_orbiting(O::circular("Moon", 7.342E22, 1737.4E3, 384399E3, 5.145, 1.0E7, [255, 255, 255]), earth, rng);
-    let mars = bodies.push_orbiting(O::circular("Mars", 6.4171E23, 3389.5E3, 1.52368055 * AU, 1.850, 2.0E7, [255, 50, 0]), sun, rng);
-    bodies.push_orbiting(O::circular("Jupiter", 1.8982E27, 69911E3, 5.2038 * AU, 1.303, 2.0E7, [216, 202, 157]), sun, rng);
-    bodies.push_orbiting(O::circular("Saturn", 5.6834E26, 58232E3, 9.5826 * AU, 2.485, 2.0E7, [191, 189, 175]), sun, rng);
-    bodies.push_orbiting(O::circular("Uranus", 8.681E25, 25362E3, 19.19126 * AU, 0.773, 2.0E7, [209, 231, 231]), sun, rng);
-    bodies.push_orbiting(O::circular("Neptune", 1.02413E26, 24622E3, 30.07 * AU, 1.770, 2.0E7, [39, 70, 135]), sun, rng);
-    bodies.push_orbiting(O::circular("Phobos", 1.0659E16, 11.2667E3, 9376E3, 26.04, 2.0E11, [200, 200, 200]), mars, rng);
-    bodies.push_orbiting(O::circular("Deimos", 1.4762E15, 6.2E3, 23463.2E3, 27.58, 2.0E11, [150, 150, 150]), mars, rng);
-    // Never 4get
-    bodies.push_orbiting(O::circular("Pluto", 1.303E22, 2376.6E3, 39.482 * AU, 17.16, 2.0E7, [190, 190, 255]), sun, rng);
-    bodies.push_orbiting(O::circular("International Space Station", 450.0E3, 100.0, 6371.0E3 + 418000.0, 51.64, 1.0E7, [0, 0, 160]), earth, rng);
+        // On the equator the bulge pulls inwards
+        let equator = shape.pole.any_orthonormal_vector() * 4.2E8;
+        assert!(shape.acceleration(gm, equator).dot(equator) < 0.0);
+    }
 }
