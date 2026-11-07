@@ -1,121 +1,99 @@
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Color32, FontId, Painter, Pos2, Response, Shape, Stroke};
-use glam::DVec3;
-use uuid::Uuid;
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
 
-use crate::engine;
-use crate::integration::IntegrationMethod;
-use crate::SolarApp;
+use solar_rust::astronomy::{Bodies, BodyId};
+use solar_rust::engine::{Snapshot, Status};
+use solar_rust::integration::IntegrationMethod;
 
-pub struct TargetData {
-    pub uuid: Uuid,
-    pub x: f32,
-    pub y: f32,
+use crate::camera::Camera;
+
+const TEXT_REFRESH: Duration = Duration::from_millis(500);
+const LINE_HEIGHT: f32 = 16.0;
+const MARGIN: f32 = 5.0;
+
+/// A body as drawn on screen, used for click hit-testing
+pub struct Target {
+    pub id: BodyId,
+    pub center: Pos2,
     pub radius: f32,
 }
 
-pub fn paint(app: &mut SolarApp, painter: &Painter, response: &Response) {
-    let now = Instant::now();
+/// Returns the nearest (topmost) body under `pos`. `targets` are in drawing order, farthest first.
+pub fn hit_test(targets: &[Target], pos: Pos2) -> Option<BodyId> {
+    targets
+        .iter()
+        .rev()
+        .find(|t| t.center.distance_sq(pos) <= t.radius * t.radius)
+        .map(|t| t.id)
+}
 
-    if app.next_status_update <= now {
-        app.status_lines = get_status_text(app);
-        app.object_description = get_object_description_text(app);
-        app.next_status_update = Instant::now() + Duration::from_millis(500);
-    }
+/// Draws all bodies farthest to nearest, and records where each one ended up in `targets`.
+pub fn paint_bodies(
+    painter: &Painter,
+    rect: Rect,
+    bodies: &Bodies,
+    camera: &Camera,
+    targets: &mut Vec<Target>,
+) {
+    const MAX_MAGNIFIED_RADIUS: f64 = 10.0;
+    const MIN_RADIUS: f64 = 3.0;
 
-    let rect = response.rect;
-    let screen_width = rect.width() as f64;
-    let screen_height = rect.height() as f64;
+    let screen_center = rect.center();
+    let screen_scalar = rect.width() as f64 / 2.0 / (camera.fov / 2.0).to_radians().tan();
+    let transform = camera.view_transform();
 
-    let bodies = app.engine.objects.lock().unwrap();
-    let camera = &mut app.camera;
-
-    let screen_scalar = screen_width / 2.0 / (camera.fov / 2.0).to_radians().tan();
-
-    if let Some(target) = app.current_target {
-        if let Some(b) = bodies.iter().find(|x| x.uuid == target) {
-            camera.target = match camera.get_animation_position(b.position, b.radius) {
-                Some((target, distance)) => {
-                    camera.distance = distance;
-
-                    if target == b.position {
-                        camera.animation_start = None;
-                    }
-
-                    target
-                }
-                None => b.position,
-            };
-        } else {
-            app.current_target = None;
-            camera.target = DVec3::ZERO;
-        }
-    }
-
-    let transform = camera.get_full_transformation();
-
-    // Sort farthest-to-nearest. Distance keys are precomputed so the comparator does no math,
-    // and camera position is computed once instead of once per comparison.
-    let camera_position = camera.get_position();
-    let mut sorted_indices: Vec<(f64, usize)> = bodies
+    // Painter's algorithm: sort by distance so nearer bodies are drawn over farther ones
+    let camera_position = camera.position();
+    let mut draw_order: Vec<(f64, usize)> = bodies
+        .position
         .iter()
         .enumerate()
-        .map(|(i, body)| (body.position.distance_squared(camera_position), i))
+        .map(|(i, p)| (p.distance_squared(camera_position), i))
         .collect();
-    sorted_indices.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    draw_order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
 
-    app.targets.clear();
-    app.targets.reserve(bodies.len());
+    targets.clear();
 
-    for (_, i) in sorted_indices {
-        let body = &bodies[i];
-        let pos = transform.transform_point3(body.position);
+    for (_, i) in draw_order {
+        let pos = transform.transform_point3(bodies.position[i]);
 
+        // Behind the camera
         if pos.z >= 1.0 {
             continue;
         }
 
         let distance_scalar = 1.0 - pos.z;
+        let center = Pos2::new(
+            screen_center.x + (pos.x / distance_scalar * screen_scalar) as f32,
+            screen_center.y - (pos.y / distance_scalar * screen_scalar) as f32,
+        );
 
-        // Transfer to screen coordinates
-        let center_x = (pos.x / distance_scalar * screen_scalar + screen_width / 2.0) as f32;
-        let center_y = (screen_height / 2.0 - pos.y / distance_scalar * screen_scalar) as f32;
-
-        let radius_without_mag = body.radius / camera.distance / distance_scalar * screen_scalar;
-        let radius_with_mag = radius_without_mag * body.magnification.cbrt();
-
-        let max_magnification = 10.0;
-        let mut radius = if radius_without_mag < max_magnification {
-            radius_with_mag.min(max_magnification)
+        // Small bodies are magnified to stay visible, until they're big enough on their own
+        let info = &bodies.info[i];
+        let true_radius = bodies.radius[i] / camera.distance / distance_scalar * screen_scalar;
+        let radius = if true_radius < MAX_MAGNIFIED_RADIUS {
+            (true_radius * info.magnification.cbrt()).min(MAX_MAGNIFIED_RADIUS)
         } else {
-            radius_without_mag
-        };
-        radius = radius.max(3.0);
+            true_radius
+        }
+        .max(MIN_RADIUS) as f32;
 
-        let left_x = center_x - radius as f32;
-        let right_x = center_x + radius as f32;
-
-        let top_y = center_y - radius as f32;
-        let bottom_y = center_y + radius as f32;
-
-        if right_x < rect.min.x || bottom_y < rect.min.y || left_x > rect.max.x || top_y > rect.max.y
-        {
+        if !rect.expand(radius).contains(center) {
             continue;
         }
 
-        let [r, g, b] = body.color;
+        let [r, g, b] = info.color;
         painter.add(Shape::circle_filled(
-            Pos2::new(center_x, center_y),
-            radius as f32,
+            center,
+            radius,
             Color32::from_rgb(r, g, b),
         ));
 
-        app.targets.push(TargetData {
-            uuid: body.uuid,
-            x: center_x,
-            y: center_y,
-            radius: radius as f32,
+        targets.push(Target {
+            id: info.id,
+            center,
+            radius,
         });
     }
 
@@ -125,155 +103,202 @@ pub fn paint(app: &mut SolarApp, painter: &Painter, response: &Response) {
         Stroke::new(1.0, Color32::from_rgb(100, 100, 255)),
         egui::StrokeKind::Inside,
     ));
+}
 
-    let font = FontId::monospace(13.0);
-    let white = Color32::from_rgb(255, 255, 255);
-    let line_height = 16.0f32;
+/// Status (bottom left) and selected body (top left) text. Refreshed twice a second so the
+/// numbers stay readable, and immediately when a setting or the selection changes.
+pub struct Overlay {
+    status_lines: Vec<String>,
+    description: Vec<String>,
+    next_refresh: Instant,
+    shown_for: Option<(Controls, Option<BodyId>)>,
+}
 
-    let use_target_speed = app.engine.params.lock().unwrap().use_target_speed;
+/// The status values the user controls directly
+type Controls = (bool, IntegrationMethod, usize, bool, f64);
 
-    // Status lines in the bottom-left corner. "Bold" lines are drawn twice with a small x offset,
-    // since the monospace font has no separate bold face.
-    let num_lines = app.status_lines.len();
-    let text_start_y = rect.max.y - num_lines as f32 * line_height - 5.0;
+fn controls(status: &Status) -> Controls {
+    let speed_setting = if status.use_target_speed {
+        status.target_speed
+    } else {
+        status.time_step
+    };
 
-    for (i, text_str) in app.status_lines.iter().enumerate() {
-        let mut pos = Pos2::new(rect.min.x + 5.0, text_start_y + i as f32 * line_height);
+    (
+        status.running,
+        status.method,
+        status.threads,
+        status.use_target_speed,
+        speed_setting,
+    )
+}
 
-        if use_target_speed && i == 0 || !use_target_speed && i == 1 {
-            let bold_pos = pos;
-            pos.x += 0.5;
-            painter.text(bold_pos, Align2::LEFT_TOP, text_str, font.clone(), white);
+impl Default for Overlay {
+    fn default() -> Self {
+        Overlay {
+            status_lines: Vec::new(),
+            description: Vec::new(),
+            next_refresh: Instant::now(),
+            shown_for: None,
         }
-
-        painter.text(pos, Align2::LEFT_TOP, text_str, font.clone(), white);
-    }
-
-    for (i, text_str) in app.object_description.iter().enumerate() {
-        let pos = Pos2::new(rect.min.x + 5.0, rect.min.y + 5.0 + i as f32 * line_height);
-        painter.text(pos, Align2::LEFT_TOP, text_str, font.clone(), white);
     }
 }
 
-pub fn get_status_text(app: &SolarApp) -> Vec<String> {
-    let objects_len = app.engine.objects.lock().unwrap().len();
-    let params = app.engine.params.lock().unwrap().clone();
+impl Overlay {
+    pub fn update(&mut self, view: &Snapshot, selected: Option<BodyId>) {
+        let now = Instant::now();
+        let key = (controls(&view.status), selected);
 
-    let method = match params.method {
+        if now < self.next_refresh && self.shown_for == Some(key) {
+            return;
+        }
+
+        self.status_lines = status_text(&view.status, view.bodies.len());
+        self.description = selected
+            .and_then(|id| view.bodies.index_of(id))
+            .map(|i| description_text(&view.bodies, i))
+            .unwrap_or_default();
+        self.next_refresh = now + TEXT_REFRESH;
+        self.shown_for = Some(key);
+    }
+
+    pub fn paint(&self, painter: &Painter, rect: Rect, use_target_speed: bool) {
+        let font = FontId::monospace(13.0);
+        let white = Color32::WHITE;
+
+        // The setting currently under control is drawn "bold": twice, with a small offset,
+        // since the monospace font has no bold face.
+        let bold_line = if use_target_speed { 0 } else { 1 };
+        let status_top = rect.max.y - self.status_lines.len() as f32 * LINE_HEIGHT - MARGIN;
+
+        for (i, line) in self.status_lines.iter().enumerate() {
+            let pos = Pos2::new(rect.min.x + MARGIN, status_top + i as f32 * LINE_HEIGHT);
+            if i == bold_line {
+                painter.text(
+                    pos + egui::vec2(0.5, 0.0),
+                    Align2::LEFT_TOP,
+                    line,
+                    font.clone(),
+                    white,
+                );
+            }
+            painter.text(pos, Align2::LEFT_TOP, line, font.clone(), white);
+        }
+
+        for (i, line) in self.description.iter().enumerate() {
+            let pos = Pos2::new(
+                rect.min.x + MARGIN,
+                rect.min.y + MARGIN + i as f32 * LINE_HEIGHT,
+            );
+            painter.text(pos, Align2::LEFT_TOP, line, font.clone(), white);
+        }
+    }
+}
+
+fn status_text(status: &Status, body_count: usize) -> Vec<String> {
+    let method = match status.method {
         IntegrationMethod::Symplectic(k) => {
-            format!(
-                "Symplectic - {} order",
-                match k {
-                    1 => "1st",
-                    2 => "2nd",
-                    3 => "3rd",
-                    4 => "4th",
-                    _ => "??",
-                }
-            )
+            let order = match k {
+                1 => "1st",
+                2 => "2nd",
+                3 => "3rd",
+                4 => "4th",
+                _ => "??",
+            };
+            format!("Symplectic - {order} order")
         }
         IntegrationMethod::RK4 => "Runge-Kutta 4".into(),
     };
 
-    let lines = vec![
-        format!(
-            "Target speed: {:.1} d/s {}",
-            params.target_speed / 86400.0,
-            if params.target_speed >= 86400.0 * 365.0 {
-                format!("({:.2} y/s)", params.target_speed / 86400.0 / 365.0)
-            } else if params.target_speed <= 3600.0 {
-                format!("({:.2} m/s)", params.target_speed / 60.0)
-            } else if params.target_speed <= 3600.0 * 24.0 {
-                format!("({:.2} h/s)", params.target_speed / 3600.0)
-            } else {
-                "".into()
-            }
-        ),
-        format!(
-            "Timestep: {:.3} s {}",
-            params.time_step,
-            if params.time_step >= 86400.0 {
-                format!("({:.2} d)", params.time_step / 86400.0)
-            } else if params.time_step >= 3600.0 {
-                format!("({:.2} h)", params.time_step / 3600.0)
-            } else if params.time_step >= 60.0 {
-                format!("({:.2} m)", params.time_step / 60.0)
-            } else {
-                "".into()
-            }
-        ),
-        format!(
-            "Simulation time: {:.2} y",
-            params.time_elapsed / (60.0 * 60.0 * 24.0 * 365.0)
-        ),
-        format!("Objects: {}", objects_len),
-        format!("Method: {}", method),
-        format!("Threads: {}", params.num_threads),
-        format!("Speed: {:.0} n/s", params.iteration_speed),
-    ];
-
-    lines
-}
-
-pub fn get_object_description_text(app: &SolarApp) -> Vec<String> {
-    let objects = app.engine.objects.lock().unwrap();
-    let obj = if let Some(target) = app.current_target {
-        match objects.iter().find(|x| x.uuid == target) {
-            Some(object) => object,
-            None => return vec![],
-        }
+    let speed = status.target_speed;
+    let speed_detail = if speed >= 86400.0 * 365.0 {
+        format!("({:.2} y/s)", speed / 86400.0 / 365.0)
+    } else if speed <= 3600.0 {
+        format!("({:.2} m/s)", speed / 60.0)
+    } else if speed <= 86400.0 {
+        format!("({:.2} h/s)", speed / 3600.0)
     } else {
-        return vec![];
+        String::new()
     };
 
-    let mut parent_info: Vec<String> = vec!["".into(), "".into(), "".into()];
-    if let Some(parent) = engine::Engine::find_orbital_parent(obj, &objects) {
-        parent_info = vec![
-            format!(
-                " - {:.4e} m/s compared to {}",
-                (obj.velocity - parent.velocity).length(),
-                parent.name
-            ),
-            format!(
-                " - {:.4e} m/s^2 compared to {}",
-                (obj.acceleration - parent.acceleration).length(),
-                parent.name
-            ),
-            format!(
-                " - {:.4e} J compared to {}",
-                0.5 * (obj.velocity - parent.velocity).length_squared() * obj.mass,
-                parent.name
-            ),
-        ]
-    }
+    let step = status.time_step;
+    let step_detail = if step >= 86400.0 {
+        format!("({:.2} d)", step / 86400.0)
+    } else if step >= 3600.0 {
+        format!("({:.2} h)", step / 3600.0)
+    } else if step >= 60.0 {
+        format!("({:.2} m)", step / 60.0)
+    } else {
+        String::new()
+    };
 
     vec![
-        format!("Name: {}", obj.name),
-        format!("Mass: {:.4e} kg", obj.mass),
-        format!("Radius: {:.4e} m", obj.radius),
-        format!("Speed: {:.4e} m/s{}", obj.velocity.length(), parent_info[0]),
+        format!("Target speed: {:.1} d/s {speed_detail}", speed / 86400.0),
+        format!("Timestep: {step:.3} s {step_detail}"),
         format!(
-            "Acceleration magnitude: {:.4e} m/s^2{}",
-            obj.acceleration.length(),
-            parent_info[1]
+            "Simulation time: {:.2} y",
+            status.time_elapsed / (86400.0 * 365.0)
+        ),
+        format!("Objects: {body_count}"),
+        format!("Method: {method}"),
+        format!("Threads: {}", status.threads),
+        format!("Speed: {:.0} n/s", status.steps_per_second),
+    ]
+}
+
+fn description_text(bodies: &Bodies, i: usize) -> Vec<String> {
+    let (mass, velocity, acceleration) =
+        (bodies.mass[i], bodies.velocity[i], bodies.acceleration[i]);
+    let position = bodies.position[i];
+
+    // Values relative to the body it orbits, if any
+    let [relative_speed, relative_acceleration, relative_energy] = match bodies.orbital_parent(i) {
+        Some(p) => {
+            let parent = &bodies.info[p].name;
+            let relative_velocity = velocity - bodies.velocity[p];
+            [
+                format!(
+                    " - {:.4e} m/s compared to {parent}",
+                    relative_velocity.length()
+                ),
+                format!(
+                    " - {:.4e} m/s^2 compared to {parent}",
+                    (acceleration - bodies.acceleration[p]).length()
+                ),
+                format!(
+                    " - {:.4e} J compared to {parent}",
+                    0.5 * mass * relative_velocity.length_squared()
+                ),
+            ]
+        }
+        None => Default::default(),
+    };
+
+    vec![
+        format!("Name: {}", bodies.info[i].name),
+        format!("Mass: {mass:.4e} kg"),
+        format!("Radius: {:.4e} m", bodies.radius[i]),
+        format!("Speed: {:.4e} m/s{relative_speed}", velocity.length()),
+        format!(
+            "Acceleration magnitude: {:.4e} m/s^2{relative_acceleration}",
+            acceleration.length()
         ),
         format!(
-            "Kinetic energy: {:.4e} J{}",
-            0.5 * obj.mass * obj.velocity.length_squared(),
-            parent_info[2]
+            "Kinetic energy: {:.4e} J{relative_energy}",
+            0.5 * mass * velocity.length_squared()
         ),
-        "".into(),
+        String::new(),
         format!(
             "Position: [{:.4e}, {:.4e}, {:.4e}]",
-            obj.position.x, obj.position.y, obj.position.z
+            position.x, position.y, position.z
         ),
         format!(
             "Velocity: [{:.4e}, {:.4e}, {:.4e}]",
-            obj.velocity.x, obj.velocity.y, obj.velocity.z
+            velocity.x, velocity.y, velocity.z
         ),
         format!(
             "Acceleration: [{:.4e}, {:.4e}, {:.4e}]",
-            obj.acceleration.x, obj.acceleration.y, obj.acceleration.z
+            acceleration.x, acceleration.y, acceleration.z
         ),
     ]
 }
