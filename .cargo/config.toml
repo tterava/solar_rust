@@ -1,0 +1,4 @@
+# Lets the force kernel use 4-wide AVX2 SIMD instead of 2-wide SSE2. x86-64-v3 runs on any
+# x86 CPU from about 2013 onwards (Intel Haswell, AMD Zen).
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]

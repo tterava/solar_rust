@@ -3,6 +3,7 @@ use std::ops::Range;
 use glam::DVec3;
 use rayon::prelude::*;
 use rayon::ThreadPool;
+use wide::f64x4;
 
 use crate::astronomy::{Bodies, Merge};
 
@@ -177,8 +178,9 @@ fn offset(out: &mut [DVec3], base: &[DVec3], delta: &[DVec3], scale: f64) {
 /// Gravitational force evaluation, either on the calling thread or spread over a thread pool
 struct Forces {
     pool: Option<ThreadPool>,
+    input: KernelInput,
     /// One acceleration buffer per thread, summed after each evaluation
-    partials: Vec<Vec<DVec3>>,
+    partials: Vec<Columns>,
 }
 
 impl Forces {
@@ -192,6 +194,7 @@ impl Forces {
 
         Forces {
             pool,
+            input: KernelInput::default(),
             partials: Vec::new(),
         }
     }
@@ -216,79 +219,177 @@ impl Forces {
         radius: &[f64],
         acc: &mut [DVec3],
     ) -> Option<Collision> {
-        acc.fill(DVec3::ZERO);
+        let n = pos.len();
+        self.input.load(pos, mass, radius);
+        let input = &self.input;
 
-        let collision = match &self.pool {
-            None => accumulate_pairs(0..pos.len(), pos, mass, radius, acc),
-            Some(pool) => {
-                // Each thread takes a block of rows with an equal share of the pairs, and adds
-                // into its own buffer, since a pair also writes to the other body's row.
-                let blocks = balanced_row_blocks(pos.len(), pool.current_num_threads());
-                self.partials.resize_with(blocks.len(), Vec::new);
-
-                let collision = pool.install(|| {
-                    self.partials
-                        .par_iter_mut()
-                        .zip(blocks)
-                        .filter_map(|(partial, rows)| {
-                            partial.clear();
-                            partial.resize(pos.len(), DVec3::ZERO);
-                            accumulate_pairs(rows, pos, mass, radius, partial)
-                        })
-                        .min() // The first pair in row order, same as single-threaded
-                });
-
-                for partial in &self.partials {
-                    add_scaled(acc, partial, 1.0);
-                }
+        match &self.pool {
+            None => {
+                self.partials.resize_with(1, Columns::default);
+                let collision = accumulate_pairs(0..n, input, &mut self.partials[0]);
+                sum_partials(&self.partials, 0, acc);
                 collision
             }
-        };
+            Some(pool) => pool.install(|| {
+                // Each thread takes a block of rows with an equal share of the pairs, and adds
+                // into its own buffer, since a pair also writes to the other body's row.
+                let blocks = balanced_row_blocks(n, pool.current_num_threads());
+                self.partials.resize_with(blocks.len(), Columns::default);
 
-        // G is applied once per body instead of once per pair
-        for a in acc.iter_mut() {
-            *a *= G;
+                let collision = self
+                    .partials
+                    .par_iter_mut()
+                    .zip(blocks)
+                    .filter_map(|(partial, rows)| accumulate_pairs(rows, input, partial))
+                    .min(); // The first pair in row order, same as single-threaded
+
+                // The buffers are summed in parallel too: they're in other cores' caches,
+                // which makes this slow enough to matter on one thread
+                const CHUNK: usize = 64;
+                let partials = &self.partials;
+                acc.par_chunks_mut(CHUNK)
+                    .enumerate()
+                    .for_each(|(c, chunk)| sum_partials(partials, c * CHUNK, chunk));
+
+                collision
+            }),
         }
-
-        collision
     }
+}
+
+/// acc[k] = G * the sum of the partial accelerations of body `first + k`.
+/// G is applied once per body instead of once per pair.
+fn sum_partials(partials: &[Columns], first: usize, acc: &mut [DVec3]) {
+    for (i, a) in (first..).zip(acc) {
+        *a = G * partials.iter().map(|p| p.get(i)).sum::<DVec3>();
+    }
+}
+
+/// Bodies per SIMD register
+const LANES: usize = 4;
+
+/// One array per vector component, so the values of 4 neighbouring bodies load straight
+/// into a SIMD register.
+#[derive(Default)]
+struct Columns {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    z: Vec<f64>,
+}
+
+impl Columns {
+    fn get(&self, i: usize) -> DVec3 {
+        DVec3::new(self.x[i], self.y[i], self.z[i])
+    }
+
+    fn fill(&mut self, len: usize, value: f64) {
+        for column in [&mut self.x, &mut self.y, &mut self.z] {
+            column.clear();
+            column.resize(len, value);
+        }
+    }
+}
+
+/// The kernel's copy of the bodies, padded with dummy bodies up to a whole SIMD register past
+/// the last one, so every row can be processed in whole chunks of [`LANES`]. The dummies are
+/// massless and so far away that their pull comes out as exactly 0, and they never touch anything.
+#[derive(Default)]
+struct KernelInput {
+    len: usize,
+    pos: Columns,
+    mass: Vec<f64>,
+    radius: Vec<f64>,
+}
+
+impl KernelInput {
+    fn load(&mut self, pos: &[DVec3], mass: &[f64], radius: &[f64]) {
+        let padded = pos.len() + LANES - 1;
+        self.len = pos.len();
+
+        self.pos.fill(padded, f64::MAX);
+        for (i, p) in pos.iter().enumerate() {
+            (self.pos.x[i], self.pos.y[i], self.pos.z[i]) = (p.x, p.y, p.z);
+        }
+        for (column, values) in [(&mut self.mass, mass), (&mut self.radius, radius)] {
+            column.clear();
+            column.extend_from_slice(values);
+            column.resize(padded, 0.0);
+        }
+    }
+}
+
+fn load(column: &[f64], j: usize) -> f64x4 {
+    f64x4::new(column[j..j + LANES].try_into().unwrap())
+}
+
+/// column[j..j + 4] -= value
+fn subtract(column: &mut [f64], j: usize, value: f64x4) {
+    let lanes: &mut [f64; LANES] = (&mut column[j..j + LANES]).try_into().unwrap();
+    *lanes = (f64x4::new(*lanes) - value).to_array();
 }
 
 /// Adds the pull between body i and every later body j, for i in `rows`, into `acc`
 /// (without the factor G). Each pair is visited once and applied to both bodies
-/// (Newton's 3rd law). Returns the first touching pair found.
+/// (Newton's 3rd law), 4 pairs at a time. Returns the first touching pair found.
 fn accumulate_pairs(
     rows: Range<usize>,
-    pos: &[DVec3],
-    mass: &[f64],
-    radius: &[f64],
-    acc: &mut [DVec3],
+    input: &KernelInput,
+    acc: &mut Columns,
 ) -> Option<Collision> {
+    let KernelInput {
+        len: n,
+        ref pos,
+        ref mass,
+        ref radius,
+    } = *input;
+    acc.fill(mass.len(), 0.0);
     let mut collision = None;
 
     for i in rows {
-        let (pos_i, mass_i, radius_i) = (pos[i], mass[i], radius[i]);
-        // Accumulate in a local so it stays in registers instead of going through memory every pair
-        let mut acc_i = DVec3::ZERO;
+        let (x_i, y_i, z_i) = (
+            f64x4::splat(pos.x[i]),
+            f64x4::splat(pos.y[i]),
+            f64x4::splat(pos.z[i]),
+        );
+        let (mass_i, radius_i) = (f64x4::splat(mass[i]), f64x4::splat(radius[i]));
+        // Body i's sums are kept in registers, one partial sum per lane
+        let (mut ax_i, mut ay_i, mut az_i) = (f64x4::ZERO, f64x4::ZERO, f64x4::ZERO);
 
-        for j in i + 1..pos.len() {
-            let difference = pos[j] - pos_i;
-            let distance_sq = difference.length_squared();
+        for j in (i + 1..n).step_by(LANES) {
+            let dx = load(&pos.x, j) - x_i;
+            let dy = load(&pos.y, j) - y_i;
+            let dz = load(&pos.z, j) - z_i;
+            let distance_sq = dx * dx + dy * dy + dz * dz;
 
-            let touching_distance = radius_i + radius[j];
-            if distance_sq <= touching_distance * touching_distance && collision.is_none() {
-                collision = Some((i, j));
+            if collision.is_none() {
+                let touching_distance = load(radius, j) + radius_i;
+                let touching = distance_sq.simd_le(touching_distance * touching_distance);
+                if touching.any() {
+                    collision = Some((i, j + touching.to_bitmask().trailing_zeros() as usize));
+                }
             }
 
             // difference / distance^3 = unit vector / distance^2
-            let inv_distance = distance_sq.sqrt().recip();
-            let pull = difference * (inv_distance * inv_distance * inv_distance);
+            let inv_distance_cubed = f64x4::ONE / (distance_sq * distance_sq.sqrt());
+            let (px, py, pz) = (
+                dx * inv_distance_cubed,
+                dy * inv_distance_cubed,
+                dz * inv_distance_cubed,
+            );
 
-            acc_i += pull * mass[j];
-            acc[j] -= pull * mass_i;
+            let mass_j = load(mass, j);
+            ax_i += px * mass_j;
+            ay_i += py * mass_j;
+            az_i += pz * mass_j;
+
+            subtract(&mut acc.x, j, px * mass_i);
+            subtract(&mut acc.y, j, py * mass_i);
+            subtract(&mut acc.z, j, pz * mass_i);
         }
 
-        acc[i] += acc_i;
+        acc.x[i] += ax_i.reduce_add();
+        acc.y[i] += ay_i.reduce_add();
+        acc.z[i] += az_i.reduce_add();
     }
 
     collision
@@ -332,6 +433,49 @@ mod tests {
         bodies
     }
 
+    /// Straight from Newton's law of gravitation, one body at a time
+    fn reference_accelerations(bodies: &Bodies) -> Vec<DVec3> {
+        (0..bodies.len())
+            .map(|i| {
+                (0..bodies.len())
+                    .filter(|&j| j != i)
+                    .map(|j| {
+                        let difference = bodies.position[j] - bodies.position[i];
+                        G * bodies.mass[j] * difference / difference.length().powi(3)
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// Covers every body count modulo the SIMD width, to exercise the padding
+    #[test]
+    fn forces_match_reference() {
+        for extra in [0, 1, 2, 3, 200] {
+            let bodies = test_system(extra);
+            let expected = reference_accelerations(&bodies);
+
+            for threads in [1, 3] {
+                let mut acc = vec![DVec3::ZERO; bodies.len()];
+                let collision = Forces::new(threads).compute(
+                    &bodies.position,
+                    &bodies.mass,
+                    &bodies.radius,
+                    &mut acc,
+                );
+                assert_eq!(collision, None);
+
+                for (i, (a, e)) in acc.iter().zip(&expected).enumerate() {
+                    assert!(
+                        (*a - *e).length() <= 1e-9 * e.length(),
+                        "n={}, threads={threads}, body {i}: {a} vs {e}",
+                        bodies.len()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn parallel_forces_match_pairwise() {
         let bodies = test_system(200);
@@ -364,18 +508,22 @@ mod tests {
 
     #[test]
     fn collisions_found_by_both_kernels() {
-        let mut bodies = test_system(0);
-        bodies.position[5] = bodies.position[3]; // Put Mars on top of Earth
+        // Put a body on top of the Earth (3). Earth's row starts at 4, so 4..=8 covers every
+        // SIMD lane and the start of the next register.
+        for other in 4..=8 {
+            let mut bodies = test_system(0);
+            bodies.position[other] = bodies.position[3];
 
-        for threads in [1, 4] {
-            let mut acc = vec![DVec3::ZERO; bodies.len()];
-            let found = Forces::new(threads).compute(
-                &bodies.position,
-                &bodies.mass,
-                &bodies.radius,
-                &mut acc,
-            );
-            assert_eq!(found, Some((3, 5)), "threads = {threads}");
+            for threads in [1, 4] {
+                let mut acc = vec![DVec3::ZERO; bodies.len()];
+                let found = Forces::new(threads).compute(
+                    &bodies.position,
+                    &bodies.mass,
+                    &bodies.radius,
+                    &mut acc,
+                );
+                assert_eq!(found, Some((3, other)), "threads = {threads}");
+            }
         }
     }
 
