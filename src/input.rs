@@ -3,6 +3,7 @@ use egui::{Key, PointerButton, Response, Ui};
 use solar_rust::astronomy::OrbitalObject;
 use solar_rust::engine::Command;
 
+use crate::camera::FAST_ZOOM_NOTCHES;
 use crate::{ui, SolarApp};
 
 const THREAD_KEYS: [Key; 9] = [
@@ -34,9 +35,15 @@ pub fn handle_input(app: &mut SolarApp, ui: &Ui, response: &Response) {
         }
     }
 
-    // Zoom with mouse wheel
+    // Zoom with mouse wheel, faster while holding shift
     if response.contains_pointer() {
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        let (delta, shift) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers.shift));
+        // egui turns scrolling into horizontal scrolling while shift is down
+        let scroll = if shift {
+            (delta.x + delta.y) * FAST_ZOOM_NOTCHES
+        } else {
+            delta.y
+        };
         if scroll != 0.0 {
             app.camera.zoom(scroll);
         }

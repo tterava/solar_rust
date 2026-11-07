@@ -18,6 +18,9 @@ const ROTATE_SENSITIVITY: f64 = 0.003;
 /// egui reports one mouse wheel notch as 40 points of scroll
 const ZOOM_PER_NOTCH: f64 = 1.1;
 const SCROLL_POINTS_PER_NOTCH: f64 = 40.0;
+/// Holding shift zooms this many notches per notch: 1.1^5 = 1.6x. From following a small moon
+/// out to the whole solar system is then about 25 notches instead of 130.
+pub const FAST_ZOOM_NOTCHES: f32 = 5.0;
 
 /// Rotates the ecliptic frame (z up) into the view frame (Y up)
 fn ecliptic_to_view() -> DAffine3 {
