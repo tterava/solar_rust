@@ -18,6 +18,12 @@ pub const C: f64 = 299_792_458.0;
 /// Indices of two bodies that are touching
 pub type Collision = (usize, usize);
 
+/// Relativistic corrections are computed for every pair of bodies that includes one at least
+/// this heavy (GM in m^3/s^2): the Sun, the planets, the Moon, the largest moons and Eris. For
+/// the other pairs they're about 1e-8 of a pull that's already tiny. DE440 likewise treats its
+/// asteroids as Newtonian.
+const RELATIVITY_MIN_GM: f64 = 1.0E12;
+
 /// Distance in reference radii beyond which oblateness is ignored. At 1000 radii the largest J2
 /// (Saturn's, 0.016) times (R/r)^2 = 10^-6 adds about 10^-8 to the oblate body's pull, which is
 /// itself tiny there compared to the Sun's.
@@ -121,21 +127,23 @@ impl Forces {
         radius: &[f64],
         acc: &mut [DVec3],
     ) -> Option<Collision> {
-        let n = pos.len();
         self.input.load(pos, mass, radius);
         let input = &self.input;
+        // Pairs of massless bodies don't pull on each other, and they come last
+        let (rows, n) = (input.massive, input.len);
+        let order = &input.order;
 
-        match &self.pool {
+        let collision = match &self.pool {
             None => {
                 self.partials.resize_with(1, Columns::default);
-                let collision = accumulate_pairs(0..n, input, &mut self.partials[0]);
-                sum_partials(&self.partials, 0, acc);
+                let collision = accumulate_pairs(0..rows, input, &mut self.partials[0]);
+                sum_partials(&self.partials, &input.slot, 0, acc);
                 collision
             }
             Some(pool) => pool.install(|| {
                 // Each thread takes a block of rows with an equal share of the pairs, and adds
                 // into its own buffer, since a pair also writes to the other body's row.
-                let blocks = balanced_row_blocks(n, pool.current_num_threads());
+                let blocks = balanced_row_blocks(rows, n, pool.current_num_threads());
                 self.partials.resize_with(blocks.len(), Columns::default);
 
                 let collision = self
@@ -150,11 +158,15 @@ impl Forces {
                 let partials = &self.partials;
                 acc.par_chunks_mut(SUM_CHUNK)
                     .enumerate()
-                    .for_each(|(c, chunk)| sum_partials(partials, c * SUM_CHUNK, chunk));
+                    .for_each(|(c, chunk)| {
+                        sum_partials(partials, &input.slot, c * SUM_CHUNK, chunk)
+                    });
 
                 collision
             }),
-        }
+        };
+
+        collision.map(|(i, j)| (order[i], order[j]))
     }
 
     /// Adds the first order post-Newtonian (1PN) corrections of general relativity: the
@@ -165,16 +177,19 @@ impl Forces {
     /// `acc` must hold the accelerations without relativity, which stand in for the true
     /// accelerations inside the correction terms (the difference is of second order). Positions
     /// and masses come from `self.input`, so this has to run after [`Self::newtonian`].
+    ///
+    /// Only pairs that include a body heavier than [`RELATIVITY_MIN_GM`] are corrected.
     fn add_relativity(&mut self, vel: &[DVec3], acc: &mut [DVec3]) {
-        let n = acc.len();
         let input = &self.input;
+        let (rows, n) = (input.heavy, input.len);
         let relativity = &mut self.relativity;
-        relativity.load(vel, acc);
+        relativity.load(vel, acc, &input.order);
 
         // Newtonian potential at each body: G times the sum of m / r over the other bodies
         let potential = &mut relativity.potential;
         pairwise(
             &self.pool,
+            rows,
             n,
             &mut self.potential_partials,
             potential,
@@ -187,6 +202,7 @@ impl Forces {
         let relativity = &self.relativity;
         pairwise(
             &self.pool,
+            rows,
             n,
             &mut self.correction_partials,
             &mut self.corrections,
@@ -194,8 +210,8 @@ impl Forces {
         );
 
         let [x, y, z] = &self.corrections;
-        for (i, a) in acc.iter_mut().enumerate() {
-            *a += G / (C * C) * DVec3::new(x[i], y[i], z[i]);
+        for (a, &k) in acc.iter_mut().zip(&input.slot) {
+            *a += G / (C * C) * DVec3::new(x[k], y[k], z[k]);
         }
     }
 }
@@ -224,12 +240,13 @@ fn add_oblateness(bodies: &Bodies, pos: &[DVec3], acc: &mut [DVec3]) {
     }
 }
 
-/// Runs `kernel(rows, out)` over the rows 0..n, where row i visits the pairs (i, j > i) and may
-/// add to any element of the K output columns, which are padded like [`KernelInput`]. With a
-/// thread pool, each thread takes a block of rows with an equal share of the pairs and adds into
-/// its own buffer, and the buffers are summed into `out`.
+/// Runs `kernel(rows, out)` over the rows 0..rows of n bodies, where row i visits the pairs
+/// (i, j > i) and may add to any element of the K output columns, which are padded like
+/// [`KernelInput`]. With a thread pool, each thread takes a block of rows with an equal share of
+/// the pairs and adds into its own buffer, and the buffers are summed into `out`.
 fn pairwise<const K: usize>(
     pool: &Option<ThreadPool>,
+    rows: usize,
     n: usize,
     partials: &mut Vec<[Vec<f64>; K]>,
     out: &mut [Vec<f64>; K],
@@ -245,11 +262,11 @@ fn pairwise<const K: usize>(
     reset(out);
 
     let Some(pool) = pool else {
-        kernel(0..n, out);
+        kernel(0..rows, out);
         return;
     };
     pool.install(|| {
-        let blocks = balanced_row_blocks(n, pool.current_num_threads());
+        let blocks = balanced_row_blocks(rows, n, pool.current_num_threads());
         partials.resize_with(blocks.len(), || std::array::from_fn(|_| Vec::new()));
         partials
             .par_iter_mut()
@@ -273,11 +290,11 @@ fn pairwise<const K: usize>(
     });
 }
 
-/// acc[k] = G * the sum of the partial accelerations of body `first + k`.
-/// G is applied once per body instead of once per pair.
-fn sum_partials(partials: &[Columns], first: usize, acc: &mut [DVec3]) {
-    for (i, a) in (first..).zip(acc) {
-        *a = G * partials.iter().map(|p| p.get(i)).sum::<DVec3>();
+/// acc[k] = G * the sum of the partial accelerations of body `first + k`, which is at
+/// `slot[first + k]` in the kernel's order. G is applied once per body instead of once per pair.
+fn sum_partials(partials: &[Columns], slot: &[usize], first: usize, acc: &mut [DVec3]) {
+    for (&k, a) in slot[first..].iter().zip(acc) {
+        *a = G * partials.iter().map(|p| p.get(k)).sum::<DVec3>();
     }
 }
 
@@ -313,11 +330,12 @@ impl Columns {
         }
     }
 
-    /// Copies `values`, padded with `pad` up to `len`
-    fn load(&mut self, values: &[DVec3], len: usize, pad: f64) {
+    /// Copies `values[order[k]]` to element k, padded with `pad` up to `len`
+    fn load(&mut self, values: &[DVec3], order: &[usize], len: usize, pad: f64) {
         self.fill(len, pad);
-        for (i, v) in values.iter().enumerate() {
-            (self.x[i], self.y[i], self.z[i]) = (v.x, v.y, v.z);
+        for (k, &i) in order.iter().enumerate() {
+            let v = values[i];
+            (self.x[k], self.y[k], self.z[k]) = (v.x, v.y, v.z);
         }
     }
 }
@@ -325,9 +343,19 @@ impl Columns {
 /// The kernel's copy of the bodies, padded with dummy bodies up to a whole SIMD register past
 /// the last one, so every row can be processed in whole chunks of [`LANES`]. The dummies are
 /// massless and [`FAR`] away, so their pull comes out as exactly 0, and they never touch anything.
+///
+/// The bodies are sorted: first the ones heavy enough for relativity, then the other ones with
+/// mass, then the massless ones, so the kernels can skip the pairs they don't need.
 #[derive(Default)]
 struct KernelInput {
     len: usize,
+    /// Number of bodies at least [`RELATIVITY_MIN_GM`] heavy
+    heavy: usize,
+    /// Number of bodies with mass
+    massive: usize,
+    /// The body at each position in the kernel's order, and the reverse
+    order: Vec<usize>,
+    slot: Vec<usize>,
     pos: Columns,
     mass: Vec<f64>,
     radius: Vec<f64>,
@@ -335,13 +363,29 @@ struct KernelInput {
 
 impl KernelInput {
     fn load(&mut self, pos: &[DVec3], mass: &[f64], radius: &[f64]) {
-        let padded = pos.len() + LANES - 1;
-        self.len = pos.len();
+        let n = pos.len();
+        let padded = n + LANES - 1;
+        self.len = n;
 
-        self.pos.load(pos, padded, FAR);
+        let class = |i: usize| match G * mass[i] {
+            gm if gm >= RELATIVITY_MIN_GM => 0,
+            gm if gm > 0.0 => 1,
+            _ => 2,
+        };
+        self.order.clear();
+        self.order.extend(0..n);
+        self.order.sort_unstable_by_key(|&i| (class(i), i));
+        self.heavy = self.order.partition_point(|&i| class(i) == 0);
+        self.massive = self.order.partition_point(|&i| class(i) <= 1);
+        self.slot.resize(n, 0);
+        for (k, &i) in self.order.iter().enumerate() {
+            self.slot[i] = k;
+        }
+
+        self.pos.load(pos, &self.order, padded, FAR);
         for (column, values) in [(&mut self.mass, mass), (&mut self.radius, radius)] {
             column.clear();
-            column.extend_from_slice(values);
+            column.extend(self.order.iter().map(|&i| values[i]));
             column.resize(padded, 0.0);
         }
     }
@@ -359,12 +403,14 @@ struct RelativityInput {
 }
 
 impl RelativityInput {
-    fn load(&mut self, vel: &[DVec3], acc: &[DVec3]) {
+    /// Loads the bodies in the kernel's `order`
+    fn load(&mut self, vel: &[DVec3], acc: &[DVec3], order: &[usize]) {
         let padded = vel.len() + LANES - 1;
-        self.vel.load(vel, padded, 0.0);
-        self.acc.load(acc, padded, 0.0);
+        self.vel.load(vel, order, padded, 0.0);
+        self.acc.load(acc, order, padded, 0.0);
         self.speed_sq.clear();
-        self.speed_sq.extend(vel.iter().map(|v| v.length_squared()));
+        self.speed_sq
+            .extend(order.iter().map(|&i| vel[i].length_squared()));
         self.speed_sq.resize(padded, 0.0);
     }
 }
@@ -605,6 +651,7 @@ fn accumulate_pairs(
         ref pos,
         ref mass,
         ref radius,
+        ..
     } = *input;
     acc.fill(mass.len(), 0.0);
     let mut collision = None;
@@ -659,22 +706,23 @@ fn accumulate_pairs(
     collision
 }
 
-/// Splits rows 0..n into at most `blocks` contiguous ranges with roughly the same number of
-/// pairs each. Row i has n - 1 - i pairs, so early blocks get fewer rows than late ones.
-fn balanced_row_blocks(n: usize, blocks: usize) -> Vec<Range<usize>> {
-    let total_pairs = n * n.saturating_sub(1) / 2;
+/// Splits rows 0..rows of n bodies into at most `blocks` contiguous ranges with roughly the same
+/// number of pairs each. Row i has n - 1 - i pairs, so early blocks get fewer rows than late ones.
+fn balanced_row_blocks(rows: usize, n: usize, blocks: usize) -> Vec<Range<usize>> {
+    let pairs_in = |row: usize| n - 1 - row;
+    let total_pairs: usize = (0..rows).map(pairs_in).sum();
     let mut ranges = Vec::with_capacity(blocks);
     let (mut start, mut pairs) = (0, 0);
 
-    for i in 0..n {
-        pairs += n - 1 - i;
+    for i in 0..rows {
+        pairs += pairs_in(i);
         if pairs * blocks >= total_pairs * (ranges.len() + 1) {
             ranges.push(start..i + 1);
             start = i + 1;
         }
     }
-    if start < n {
-        ranges.push(start..n);
+    if start < rows {
+        ranges.push(start..rows);
     }
 
     ranges
@@ -768,10 +816,16 @@ mod tests {
     #[test]
     fn row_blocks_cover_every_row_once() {
         for n in [0, 1, 2, 3, 13, 100, 1000] {
-            for blocks in [1, 2, 3, 12] {
-                let ranges = balanced_row_blocks(n, blocks);
-                let rows: Vec<usize> = ranges.iter().flat_map(|r| r.clone()).collect();
-                assert_eq!(rows, (0..n).collect::<Vec<_>>(), "n={n}, blocks={blocks}");
+            for rows in [n, n / 2] {
+                for blocks in [1, 2, 3, 12] {
+                    let ranges = balanced_row_blocks(rows, n, blocks);
+                    let covered: Vec<usize> = ranges.iter().flat_map(|r| r.clone()).collect();
+                    assert_eq!(
+                        covered,
+                        (0..rows).collect::<Vec<_>>(),
+                        "n={n}, blocks={blocks}"
+                    );
+                }
             }
         }
     }
@@ -844,15 +898,18 @@ mod tests {
     }
 
     /// The EIH corrections one body at a time, straight from the formula (with `newtonian` as
-    /// the accelerations inside it), divided by c^2
+    /// the accelerations inside it), divided by c^2, for the pairs that include a heavy body
     fn reference_corrections(bodies: &Bodies, newtonian: &[DVec3]) -> Vec<DVec3> {
         let (pos, vel) = (&bodies.position, &bodies.velocity);
         let n = bodies.len();
         let gm = |j: usize| G * bodies.mass[j];
+        let counted = |i: usize, j: usize| {
+            j != i && (gm(i) >= RELATIVITY_MIN_GM || gm(j) >= RELATIVITY_MIN_GM)
+        };
         let potential: Vec<f64> = (0..n)
             .map(|i| {
                 (0..n)
-                    .filter(|&j| j != i)
+                    .filter(|&j| counted(i, j))
                     .map(|j| gm(j) / pos[i].distance(pos[j]))
                     .sum()
             })
@@ -861,7 +918,7 @@ mod tests {
         (0..n)
             .map(|i| {
                 let correction: DVec3 = (0..n)
-                    .filter(|&j| j != i)
+                    .filter(|&j| counted(i, j))
                     .map(|j| {
                         let (v_i, v_j, a_j) = (vel[i], vel[j], newtonian[j]);
                         let r_ij = pos[j] - pos[i];
@@ -902,10 +959,11 @@ mod tests {
 
                 for i in 0..n {
                     let correction = full[i] - newtonian[i];
-                    // Rounding the corrections into the much larger accelerations leaves
-                    // about 1e-8 of them, relative to themselves
+                    // Adding the corrections to the much larger accelerations rounds them
+                    // to about 1e-16 of the acceleration
+                    let tolerance = 1e-6 * expected[i].length() + 1e-15 * newtonian[i].length();
                     assert!(
-                        (correction - expected[i]).length() <= 1e-6 * expected[i].length(),
+                        (correction - expected[i]).length() <= tolerance,
                         "n={n}, threads={threads}, body {i}: {correction} vs {}",
                         expected[i]
                     );

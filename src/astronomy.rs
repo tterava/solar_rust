@@ -171,12 +171,16 @@ impl Bodies {
         let (m_keep, m_gone) = (self.mass[keep], self.mass[gone]);
         let total_mass = m_keep + m_gone;
 
-        self.velocity[keep] =
-            (self.velocity[keep] * m_keep + self.velocity[gone] * m_gone) / total_mass;
-        let to_center_of_mass = (self.position[gone] - self.position[keep]) * (m_gone / total_mass);
-        self.position[keep] += to_center_of_mass;
-        self.radius[keep] *= (total_mass / m_keep).cbrt();
-        self.mass[keep] = total_mass;
+        // Two massless bodies (spacecraft, say): the kept one just carries on
+        if total_mass > 0.0 {
+            self.velocity[keep] =
+                (self.velocity[keep] * m_keep + self.velocity[gone] * m_gone) / total_mass;
+            let to_center_of_mass =
+                (self.position[gone] - self.position[keep]) * (m_gone / total_mass);
+            self.position[keep] += to_center_of_mass;
+            self.radius[keep] *= (total_mass / m_keep).cbrt();
+            self.mass[keep] = total_mass;
+        }
 
         let merge = Merge {
             absorbed: self.info[gone].name.clone(),

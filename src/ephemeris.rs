@@ -21,7 +21,8 @@ const EPOCH_STATES: &str = include_str!("../data/horizons_2026-01-01.csv");
 
 pub struct KnownBody {
     pub name: &'static str,
-    /// Target id for the Horizons API. "N;" is the asteroid with number N.
+    /// Target id for the Horizons API. "N;" is the asteroid with number N, "DES=..." a
+    /// designation, and negative ids are spacecraft.
     pub horizons_id: &'static str,
     /// Gravitational parameter G * mass in km^3/s^2, which is known far more precisely
     /// than G or the mass alone
@@ -50,8 +51,12 @@ const fn body(
     }
 }
 
-/// GM and radii are from Horizons' physical data for each body (DE441 and the JPL
-/// satellite ephemerides). Planets are their own GM, without their moons.
+/// GM and radii are from Horizons' physical data for each body (DE441 and the JPL satellite
+/// ephemerides), unless noted. Planets are their own GM, without their moons. Asteroid GMs are
+/// the ones DE440 was integrated with (its header's MA constants). Radii of irregular bodies
+/// are those of a sphere with the same volume.
+///
+/// GM 0 means the body's pull is ignored: its mass isn't known, or is too small to matter.
 #[rustfmt::skip]
 pub const KNOWN_BODIES: &[KnownBody] = &[
     body("Sun", "10", 132712440041.93938, 695700.0, [255, 255, 0], 100.0),
@@ -67,6 +72,18 @@ pub const KNOWN_BODIES: &[KnownBody] = &[
     body("Europa", "502", 3202.7121, 1560.8, [200, 180, 150], 1.0E8),
     body("Ganymede", "503", 9887.8328, 2631.2, [160, 150, 140], 1.0E8),
     body("Callisto", "504", 7179.2834, 2410.3, [110, 100, 90], 1.0E8),
+    body("Amalthea", "505", 0.1646, 83.5, [180, 90, 60], 1.0E9),
+    body("Himalia", "506", 0.151552, 85.0, [140, 130, 120], 1.0E9),
+    body("Elara", "507", 0.0, 40.0, [140, 130, 120], 1.0E10),
+    body("Pasiphae", "508", 0.0, 18.0, [140, 130, 120], 1.0E10),
+    body("Sinope", "509", 0.0, 14.0, [140, 130, 120], 1.0E10),
+    body("Lysithea", "510", 0.0, 12.0, [140, 130, 120], 1.0E10),
+    body("Carme", "511", 0.0, 15.0, [140, 130, 120], 1.0E10),
+    body("Ananke", "512", 0.0, 10.0, [140, 130, 120], 1.0E10),
+    body("Leda", "513", 0.0, 5.0, [140, 130, 120], 2.0E11),
+    body("Thebe", "514", 0.0301, 49.3, [170, 100, 70], 1.0E10),
+    body("Adrastea", "515", 0.0001, 8.2, [150, 120, 100], 2.0E11),
+    body("Metis", "516", 0.0025, 21.5, [150, 120, 100], 1.0E10),
     body("Saturn", "699", 37931206.234, 58232.0, [191, 189, 175], 2.0E7),
     body("Mimas", "601", 2.503489, 198.8, [200, 200, 200], 1.0E9),
     body("Enceladus", "602", 7.210367, 252.3, [235, 235, 235], 1.0E9),
@@ -74,23 +91,99 @@ pub const KNOWN_BODIES: &[KnownBody] = &[
     body("Dione", "604", 73.116, 562.5, [190, 190, 190], 1.0E9),
     body("Rhea", "605", 153.94, 764.5, [180, 180, 180], 1.0E9),
     body("Titan", "606", 8978.14, 2575.5, [220, 170, 80], 1.0E8),
+    body("Hyperion", "607", 0.3705, 133.0, [170, 150, 120], 1.0E9),
     body("Iapetus", "608", 120.52, 734.5, [160, 140, 120], 1.0E9),
+    body("Phoebe", "609", 0.5548, 106.6, [90, 85, 80], 1.0E9),
+    // Janus and Epimetheus share an orbit and swap places every 4 years, so their masses
+    // matter. From masses 1.98E18 and 5.5E17 kg.
+    body("Janus", "610", 0.13215, 89.7, [200, 200, 190], 1.0E9),
+    body("Epimetheus", "611", 0.036709, 58.2, [200, 200, 190], 1.0E10),
+    body("Helene", "612", 0.00047574, 16.0, [220, 220, 220], 1.0E10),
+    body("Telesto", "613", 0.00048, 12.4, [220, 220, 220], 1.0E10),
+    body("Calypso", "614", 0.00024, 9.6, [220, 220, 220], 2.0E11),
+    body("Atlas", "615", 0.0, 15.1, [200, 190, 170], 1.0E10),
+    body("Prometheus", "616", 0.009344, 43.1, [200, 190, 170], 1.0E10), // From mass 1.4E17 kg
+    body("Pandora", "617", 0.0086766, 40.6, [200, 190, 170], 1.0E10), // From mass 1.3E17 kg
+    body("Pan", "618", 0.0, 14.0, [200, 190, 170], 1.0E10),
     body("Uranus", "799", 5793950.6103, 25362.0, [209, 231, 231], 2.0E7),
     body("Miranda", "705", 4.3, 235.8, [170, 170, 180], 1.0E9),
     body("Ariel", "701", 83.43, 578.9, [180, 180, 190], 1.0E9),
     body("Umbriel", "702", 85.40, 584.7, [130, 130, 140], 1.0E9),
     body("Titania", "703", 222.8, 788.9, [175, 170, 170], 1.0E9),
     body("Oberon", "704", 205.34, 761.4, [160, 150, 150], 1.0E9),
+    body("Puck", "715", 0.0, 77.0, [120, 120, 130], 1.0E9),
     body("Neptune", "899", 6835099.97, 24624.0, [39, 70, 135], 2.0E7),
     body("Triton", "801", 1428.495, 1352.6, [200, 190, 210], 1.0E8),
+    body("Nereid", "802", 0.0, 170.0, [150, 150, 160], 1.0E9),
+    body("Proteus", "808", 2.58, 208.0, [110, 110, 115], 1.0E9),
     // Never 4get
     body("Pluto", "999", 869.326, 1188.3, [190, 190, 255], 2.0E7),
     body("Charon", "901", 106.10, 606.0, [160, 160, 160], 1.0E8),
-    body("Ceres", "1;", 62.6284, 469.7, [140, 130, 120], 1.0E9),
-    body("Pallas", "2;", 13.63, 256.5, [150, 140, 130], 1.0E9),
-    body("Vesta", "4;", 17.28828, 261.385, [170, 160, 150], 1.0E9),
-    body("Hygiea", "10;", 7.0, 203.56, [120, 110, 100], 1.0E9),
-    body("International Space Station", "-125544", 3.0E-14, 0.1, [0, 0, 160], 1.0E7), // From mass 450 t
+    body("Nix", "902", 0.001496, 18.0, [220, 220, 220], 1.0E10),
+    body("Hydra", "903", 0.00201, 18.5, [220, 220, 220], 1.0E10),
+    body("Kerberos", "904", 0.00006038, 6.0, [200, 200, 200], 2.0E11),
+    body("Styx", "905", 0.0000405, 5.2, [200, 200, 200], 2.0E11),
+    // Dwarf planets beyond Neptune, with masses from their moons' orbits
+    body("Eris", "136199;", 1099.0, 1163.0, [235, 235, 235], 1.0E8), // Holler et al. 2021, Sicardy et al. 2011
+    body("Haumea", "136108;", 267.37, 797.6, [230, 230, 230], 1.0E9), // Ragozzine & Brown 2009, Ortiz et al. 2017
+    body("Makemake", "136472;", 0.0, 715.0, [200, 150, 120], 1.0E9), // Ortiz et al. 2012
+    body("Gonggong", "225088;", 116.8, 615.0, [190, 110, 90], 1.0E9), // Kiss et al. 2019
+    body("Quaoar", "50000;", 93.44, 555.0, [170, 120, 100], 1.0E9), // Fraser et al. 2013, Braga-Ribas et al. 2013
+    body("Sedna", "90377;", 0.0, 498.0, [200, 90, 70], 1.0E9), // Pal et al. 2012
+    body("Orcus", "90482;", 42.18, 458.0, [170, 170, 170], 1.0E9), // Brown et al. 2010, Fornasier et al. 2013
+    // Asteroids: the largest, and the ones spacecraft have visited
+    body("Ceres", "1;", 62.62888864, 469.7, [140, 130, 120], 1.0E9),
+    body("Pallas", "2;", 13.66587815, 256.5, [150, 140, 130], 1.0E9),
+    body("Juno", "3;", 1.92057070, 123.3, [160, 150, 140], 1.0E9),
+    body("Vesta", "4;", 17.28823288, 261.385, [170, 160, 150], 1.0E9),
+    body("Hygiea", "10;", 5.62514765, 203.56, [120, 110, 100], 1.0E9),
+    body("Eunomia", "15;", 2.02302099, 115.8, [160, 150, 140], 1.0E9),
+    body("Psyche", "16;", 1.58965824, 111.0, [170, 170, 160], 1.0E9),
+    body("Lutetia", "21;", 0.08862093, 49.0, [140, 130, 120], 1.0E10),
+    body("Euphrosyne", "31;", 1.07937146, 133.5, [110, 100, 95], 1.0E9),
+    body("52 Europa", "52;", 2.68303592, 152.0, [120, 110, 100], 1.0E9),
+    body("Sylvia", "87;", 2.16823207, 126.5, [120, 110, 100], 1.0E9),
+    body("Davida", "511;", 3.89448315, 135.2, [120, 110, 100], 1.0E9),
+    body("Interamnia", "704;", 2.83040964, 153.2, [120, 110, 100], 1.0E9),
+    body("Hektor", "624;", 0.5273, 112.5, [130, 100, 90], 1.0E9), // Jupiter trojan. Marchis et al. 2014
+    body("Ida", "243;", 0.00275, 16.0, [150, 140, 130], 1.0E10),
+    body("Eros", "433;", 0.000446270, 8.42, [170, 140, 110], 2.0E11),
+    body("Itokawa", "25143;", 2.1E-9, 0.165, [160, 150, 140], 2.0E11),
+    body("Ryugu", "162173;", 3.0E-8, 0.448, [90, 85, 80], 2.0E11),
+    body("Bennu", "101955;", 4.892E-9, 0.2412, [90, 85, 80], 2.0E11), // Scheeres et al. 2019
+    body("Apophis", "99942;", 0.0, 0.170, [160, 150, 140], 2.0E11),
+    body("Didymos", "65803;", 0.0, 0.390, [160, 150, 140], 2.0E11),
+    body("Arrokoth", "486958;", 0.0, 9.2, [170, 90, 70], 2.0E11),
+    // Comets, without the push of the gas they boil off, so they drift from JPL's
+    // positions near the Sun. "CAP" picks the orbit solution for the current apparition.
+    body("Halley", "DES=1P;CAP", 0.0, 5.5, [200, 220, 255], 2.0E11),
+    body("Encke", "DES=2P;CAP", 0.0, 2.4, [200, 220, 255], 2.0E11),
+    body("Tempel 1", "DES=9P;CAP", 0.0, 3.0, [200, 220, 255], 2.0E11),
+    body("Churyumov-Gerasimenko", "DES=67P;CAP", 0.0, 2.0, [200, 220, 255], 2.0E11),
+    body("Tempel-Tuttle", "DES=55P;CAP", 0.0, 1.8, [200, 220, 255], 2.0E11),
+    body("Swift-Tuttle", "DES=109P;CAP", 0.0, 13.0, [200, 220, 255], 2.0E11),
+    body("Hale-Bopp", "DES=C/1995 O1;", 0.0, 30.0, [200, 220, 255], 2.0E11),
+    // Visitors from interstellar space
+    body("'Oumuamua", "DES=1I;", 0.0, 0.1, [200, 120, 90], 2.0E11),
+    body("Borisov", "DES=2I;", 0.0, 0.5, [200, 220, 255], 2.0E11),
+    body("3I/ATLAS", "DES=3I;", 0.0, 1.0, [200, 220, 255], 2.0E11),
+    // Spacecraft, which drift from JPL's predictions whenever they fire their engines
+    body("James Webb Space Telescope", "-170", 0.0, 0.01, [230, 190, 60], 1.0E7),
+    body("Parker Solar Probe", "-96", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Solar Orbiter", "-144", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("BepiColombo", "-121", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Hayabusa2", "-37", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("OSIRIS-APEX", "-64", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Psyche (spacecraft)", "-255", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Lucy", "-49", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Juno (spacecraft)", "-61", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Europa Clipper", "-159", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("JUICE", "-28", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("New Horizons", "-98", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Pioneer 10", "-23", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Pioneer 11", "-24", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Voyager 1", "-31", 0.0, 0.01, [230, 230, 230], 1.0E7),
+    body("Voyager 2", "-32", 0.0, 0.01, [230, 230, 230], 1.0E7),
 ];
 
 /// Planets with moons, and the Horizons id of their system's barycenter. A planet's moons have
@@ -225,11 +318,17 @@ fn place_by_barycenter(bodies: &mut Bodies, planet: &str, barycenter: &State) {
         return;
     };
 
-    // The planet and its moons: ids starting with the same digit
+    // The planet and its moons: 3 digit ids starting with the same digit (asteroid ids end
+    // in ";" and spacecraft ids start with "-")
     let index = |name: &str| bodies.info.iter().position(|i| &*i.name == name);
+    let in_system = |id: &str| {
+        id.len() == 3
+            && id.bytes().all(|c| c.is_ascii_digit())
+            && id[..1] == planet.horizons_id[..1]
+    };
     let system: Vec<usize> = KNOWN_BODIES
         .iter()
-        .filter(|b| b.horizons_id.len() == 3 && b.horizons_id[..1] == planet.horizons_id[..1])
+        .filter(|b| in_system(b.horizons_id))
         .filter_map(|b| index(b.name))
         .collect();
 
