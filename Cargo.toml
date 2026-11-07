@@ -9,4 +9,8 @@ egui = "0.37.0"
 rand = "0.10.3"
 rayon = "1.12.0"
 glam = "0.34.2"
+# Byte views of the GPU instance and uniform structs
+bytemuck = { version = "1.25.2", features = ["derive"] }
+# Saving captures of the 3D view (and later, loading textures)
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 wide = "1.7.1"

@@ -1,5 +1,6 @@
 mod camera;
 mod input;
+mod render;
 mod ui;
 
 use std::time::Duration;
@@ -22,20 +23,48 @@ pub struct SolarApp {
     selected: Option<BodyId>,
     /// Bodies as drawn last frame, for clicking on them
     targets: Vec<ui::Target>,
+    scene: render::scene::Scene,
+    /// Where to save the 3D view once the camera has settled, from SOLAR_CAPTURE
+    capture: Option<render::Capture>,
     overlay: ui::Overlay,
 }
 
 impl SolarApp {
-    fn new() -> Self {
+    fn new(creation: &eframe::CreationContext) -> Self {
+        let render_state = creation
+            .wgpu_render_state
+            .as_ref()
+            .expect("The 3D view needs eframe's wgpu renderer");
+        render::init(render_state);
         let bodies = ephemeris::solar_system();
 
-        SolarApp {
+        let mut app = SolarApp {
             engine: Engine::new(bodies, Status::default(), PUBLISH_RATE),
             view: Snapshot::default(),
             camera: Camera::default(),
             selected: None,
             targets: Vec::new(),
+            scene: render::scene::Scene::default(),
+            capture: std::env::var_os("SOLAR_CAPTURE").map(|path| render::Capture {
+                path: path.into(),
+                done: Default::default(),
+            }),
             overlay: ui::Overlay::default(),
+        };
+        app.engine.read_latest(&mut app.view);
+        app.follow_from_environment();
+        app
+    }
+
+    /// Selects the body named in the SOLAR_FOLLOW environment variable, if any. With
+    /// SOLAR_CAPTURE=file.png, the view is then saved to that file and the app closes: handy for
+    /// checking the view without a screenshot.
+    fn follow_from_environment(&mut self) {
+        let Ok(name) = std::env::var("SOLAR_FOLLOW") else {
+            return;
+        };
+        if let Some(info) = self.view.bodies.info.iter().find(|i| *i.name == *name) {
+            self.select(info.id);
         }
     }
 
@@ -84,17 +113,28 @@ impl eframe::App for SolarApp {
             input::handle_input(self, ui, &response);
             self.update_camera();
 
-            ui::paint_bodies(
-                &painter,
-                rect,
+            render::scene::build(
                 &self.view.bodies,
                 &self.camera,
+                rect,
+                &mut self.scene,
                 &mut self.targets,
             );
+            // Captured once the fly-to animation is over
+            let capture = self.capture.clone().filter(|_| !self.camera.is_animating());
+            render::paint(&painter, rect, &self.scene, capture);
+            ui::paint_border(&painter, rect);
             self.overlay.update(&self.view, self.selected);
             self.overlay
                 .paint(&painter, rect, self.view.status.use_target_speed);
         });
+
+        if let Some(capture) = &self.capture {
+            if capture.done.load(std::sync::atomic::Ordering::Relaxed) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ui.ctx().request_repaint();
+        }
 
         // Redraw continuously while something moves (smooth scrolling included, egui doesn't
         // schedule those frames itself); otherwise just check back now and then
@@ -109,13 +149,13 @@ impl eframe::App for SolarApp {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 540.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1600.0, 900.0]),
         ..Default::default()
     };
 
     eframe::run_native(
         "Solar system simulator",
         options,
-        Box::new(|_| Ok(Box::new(SolarApp::new()))),
+        Box::new(|creation| Ok(Box::new(SolarApp::new(creation)))),
     )
 }

@@ -3080,9 +3080,11 @@ dependencies = [
 name = "solar_rust"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "eframe",
  "egui",
  "glam",
+ "image",
  "rand",
  "rayon",
  "wide",

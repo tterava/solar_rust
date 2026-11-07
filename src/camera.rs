@@ -1,19 +1,18 @@
 use std::f64::consts::{FRAC_PI_2, PI};
 use std::time::Instant;
 
-use glam::{DAffine3, DVec3};
+use glam::{DMat3, DVec3};
 
 use solar_rust::astronomy::AU;
 
 // The simulation uses the ecliptic frame, with z towards the ecliptic north. The camera works in a
-// view frame where Y is up, and is assumed to be situated on the positive side of the Z-axis at
-// (0,0,1), with target being origin. Matrix operations are used to transform the simulation space
-// into camera space. The camera is always kept in line with the Y-axis (ecliptic north is directly
-// up). In other words camera only has pitch and yaw.
+// view frame where Y is up and the camera looks down the -Z axis, from `distance` away from its
+// target. The camera is always kept in line with the Y-axis (ecliptic north is directly up). In
+// other words camera only has pitch and yaw.
 
 const FLY_TO_SECONDS: f64 = 1.5;
 /// How far the camera settles from a followed body, in body radii
-const FOLLOW_DISTANCE_RADII: f64 = 100.0;
+const FOLLOW_DISTANCE_RADII: f64 = 5.0;
 const ROTATE_SENSITIVITY: f64 = 0.003;
 /// egui reports one mouse wheel notch as 40 points of scroll
 const ZOOM_PER_NOTCH: f64 = 1.1;
@@ -23,8 +22,8 @@ const SCROLL_POINTS_PER_NOTCH: f64 = 40.0;
 pub const FAST_ZOOM_NOTCHES: f32 = 5.0;
 
 /// Rotates the ecliptic frame (z up) into the view frame (Y up)
-fn ecliptic_to_view() -> DAffine3 {
-    DAffine3::from_rotation_x(-FRAC_PI_2)
+fn ecliptic_to_view() -> DMat3 {
+    DMat3::from_rotation_x(-FRAC_PI_2)
 }
 
 pub struct Camera {
@@ -66,26 +65,16 @@ impl Camera {
         self.distance /= ZOOM_PER_NOTCH.powf(scroll_points as f64 / SCROLL_POINTS_PER_NOTCH);
     }
 
-    pub fn view_transform(&self) -> DAffine3 {
-        let translation = DAffine3::from_translation(-self.target);
-
-        let rot_y = DAffine3::from_rotation_y(-self.yaw);
-        let rot_x = DAffine3::from_rotation_x(-self.pitch);
-
-        let scale = DAffine3::from_scale(DVec3::ONE / self.distance);
-
-        scale * rot_x * rot_y * ecliptic_to_view() * translation
+    /// Rotation from the ecliptic frame into the view frame
+    pub fn view_rotation(&self) -> DMat3 {
+        DMat3::from_rotation_x(-self.pitch) * DMat3::from_rotation_y(-self.yaw) * ecliptic_to_view()
     }
 
-    pub fn position(&self) -> DVec3 {
-        let scale = DAffine3::from_scale(DVec3::ONE * self.distance);
-        let rot_y = DAffine3::from_rotation_y(self.yaw);
-        let rot_x = DAffine3::from_rotation_x(self.pitch);
-
-        let direction_vec = (ecliptic_to_view().inverse() * scale * rot_y * rot_x)
-            .transform_point3(DVec3::new(0.0, 0.0, 1.0));
-
-        self.target + direction_vec
+    /// Where `position` (ecliptic frame) is seen from the camera, in the view frame: the
+    /// camera is at the origin, looking down -Z with Y up. Computed in f64, so the result is
+    /// precise near the camera even when everything is far from the solar system's origin.
+    pub fn to_view(&self, rotation: &DMat3, position: DVec3) -> DVec3 {
+        *rotation * (position - self.target) - DVec3::new(0.0, 0.0, self.distance)
     }
 
     /// Starts flying from the current view to a body. Call [`Camera::follow`] every frame after.

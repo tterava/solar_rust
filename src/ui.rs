@@ -8,8 +8,6 @@ use solar_rust::ephemeris;
 use solar_rust::forces::Physics;
 use solar_rust::integration::IntegrationMethod;
 
-use crate::camera::Camera;
-
 const TEXT_REFRESH: Duration = Duration::from_millis(500);
 const LINE_HEIGHT: f32 = 16.0;
 const MARGIN: f32 = 5.0;
@@ -30,75 +28,8 @@ pub fn hit_test(targets: &[Target], pos: Pos2) -> Option<BodyId> {
         .map(|t| t.id)
 }
 
-/// Draws all bodies farthest to nearest, and records where each one ended up in `targets`.
-pub fn paint_bodies(
-    painter: &Painter,
-    rect: Rect,
-    bodies: &Bodies,
-    camera: &Camera,
-    targets: &mut Vec<Target>,
-) {
-    const MAX_MAGNIFIED_RADIUS: f64 = 10.0;
-    const MIN_RADIUS: f64 = 3.0;
-
-    let screen_center = rect.center();
-    let screen_scalar = rect.width() as f64 / 2.0 / (camera.fov / 2.0).to_radians().tan();
-    let transform = camera.view_transform();
-
-    // Painter's algorithm: sort by distance so nearer bodies are drawn over farther ones
-    let camera_position = camera.position();
-    let mut draw_order: Vec<(f64, usize)> = bodies
-        .position
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p.distance_squared(camera_position), i))
-        .collect();
-    draw_order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-
-    targets.clear();
-
-    for (_, i) in draw_order {
-        let pos = transform.transform_point3(bodies.position[i]);
-
-        // Behind the camera
-        if pos.z >= 1.0 {
-            continue;
-        }
-
-        let distance_scalar = 1.0 - pos.z;
-        let center = Pos2::new(
-            screen_center.x + (pos.x / distance_scalar * screen_scalar) as f32,
-            screen_center.y - (pos.y / distance_scalar * screen_scalar) as f32,
-        );
-
-        // Small bodies are magnified to stay visible, until they're big enough on their own
-        let info = &bodies.info[i];
-        let true_radius = bodies.radius[i] / camera.distance / distance_scalar * screen_scalar;
-        let radius = if true_radius < MAX_MAGNIFIED_RADIUS {
-            (true_radius * info.magnification.cbrt()).min(MAX_MAGNIFIED_RADIUS)
-        } else {
-            true_radius
-        }
-        .max(MIN_RADIUS) as f32;
-
-        if !rect.expand(radius).contains(center) {
-            continue;
-        }
-
-        let [r, g, b] = info.color;
-        painter.add(Shape::circle_filled(
-            center,
-            radius,
-            Color32::from_rgb(r, g, b),
-        ));
-
-        targets.push(Target {
-            id: info.id,
-            center,
-            radius,
-        });
-    }
-
+/// A thin frame around the view
+pub fn paint_border(painter: &Painter, rect: Rect) {
     painter.add(Shape::rect_stroke(
         rect,
         0.0,
