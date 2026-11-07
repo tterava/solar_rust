@@ -50,13 +50,11 @@ pub(crate) struct Forces {
     input: KernelInput,
     /// One acceleration buffer per thread, summed after each evaluation
     partials: Vec<Columns>,
-    /// Scratch for relativity: accelerations before it, potentials and corrections, with a
-    /// buffer per thread for the latter two
-    newtonian: Vec<DVec3>,
-    potential: Vec<f64>,
-    potential_partials: Vec<Vec<f64>>,
-    corrections: Vec<DVec3>,
-    correction_partials: Vec<Vec<DVec3>>,
+    /// Scratch for relativity: its inputs, and its outputs with a buffer per thread
+    relativity: RelativityInput,
+    potential_partials: Vec<[Vec<f64>; 1]>,
+    corrections: [Vec<f64>; 3],
+    correction_partials: Vec<[Vec<f64>; 3]>,
 }
 
 impl Forces {
@@ -73,10 +71,9 @@ impl Forces {
             physics,
             input: KernelInput::default(),
             partials: Vec::new(),
-            newtonian: Vec::new(),
-            potential: Vec::new(),
+            relativity: RelativityInput::default(),
             potential_partials: Vec::new(),
-            corrections: Vec::new(),
+            corrections: Default::default(),
             correction_partials: Vec::new(),
         }
     }
@@ -111,7 +108,7 @@ impl Forces {
             add_oblateness(bodies, pos, acc);
         }
         if self.physics.relativity {
-            self.add_relativity(&bodies.mass, pos, vel, acc);
+            self.add_relativity(vel, acc);
         }
 
         collision
@@ -150,11 +147,10 @@ impl Forces {
 
                 // The buffers are summed in parallel too: they're in other cores' caches,
                 // which makes this slow enough to matter on one thread
-                const CHUNK: usize = 64;
                 let partials = &self.partials;
-                acc.par_chunks_mut(CHUNK)
+                acc.par_chunks_mut(SUM_CHUNK)
                     .enumerate()
-                    .for_each(|(c, chunk)| sum_partials(partials, c * CHUNK, chunk));
+                    .for_each(|(c, chunk)| sum_partials(partials, c * SUM_CHUNK, chunk));
 
                 collision
             }),
@@ -167,72 +163,39 @@ impl Forces {
     /// with the PPN parameters beta = gamma = 1.
     ///
     /// `acc` must hold the accelerations without relativity, which stand in for the true
-    /// accelerations inside the correction terms (the difference is of second order).
-    fn add_relativity(&mut self, mass: &[f64], pos: &[DVec3], vel: &[DVec3], acc: &mut [DVec3]) {
-        let n = pos.len();
-        let gm = |j: usize| G * mass[j];
+    /// accelerations inside the correction terms (the difference is of second order). Positions
+    /// and masses come from `self.input`, so this has to run after [`Self::newtonian`].
+    fn add_relativity(&mut self, vel: &[DVec3], acc: &mut [DVec3]) {
+        let n = acc.len();
+        let input = &self.input;
+        let relativity = &mut self.relativity;
+        relativity.load(vel, acc);
 
-        // Newtonian potential at each body: the sum of GM / r over the other bodies
-        self.potential.clear();
-        self.potential.resize(n, 0.0);
+        // Newtonian potential at each body: G times the sum of m / r over the other bodies
+        let potential = &mut relativity.potential;
         pairwise(
             &self.pool,
+            n,
             &mut self.potential_partials,
-            &mut self.potential,
-            |rows, out| {
-                for i in rows {
-                    for j in i + 1..n {
-                        let inverse_distance = pos[i].distance(pos[j]).recip();
-                        out[i] += gm(j) * inverse_distance;
-                        out[j] += gm(i) * inverse_distance;
-                    }
-                }
-            },
+            potential,
+            |rows, [out]| accumulate_potential(rows, input, out),
         );
+        let [potential] = potential;
+        potential.iter_mut().for_each(|p| *p *= G);
+        potential[n..].fill(0.0);
 
-        self.newtonian.clear();
-        self.newtonian.extend_from_slice(acc);
-        let (potential, newtonian) = (&self.potential, &self.newtonian);
-
-        // The correction on body i from body j, given r_ij = r_j - r_i
-        let correction = |i: usize, j: usize, r_ij: DVec3, inverse_distance: f64| -> DVec3 {
-            let (v_i, v_j, a_j) = (vel[i], vel[j], newtonian[j]);
-            let radial_v_j = r_ij.dot(v_j) * inverse_distance;
-
-            let scale = -4.0 * potential[i] - potential[j]
-                + v_i.length_squared()
-                + 2.0 * v_j.length_squared()
-                - 4.0 * v_i.dot(v_j)
-                - 1.5 * radial_v_j * radial_v_j
-                + 0.5 * r_ij.dot(a_j);
-            let inverse_distance_cubed = inverse_distance * inverse_distance * inverse_distance;
-
-            gm(j)
-                * (inverse_distance_cubed
-                    * (scale * r_ij + (-r_ij).dot(4.0 * v_i - 3.0 * v_j) * (v_i - v_j))
-                    + 3.5 * inverse_distance * a_j)
-        };
-
-        self.corrections.clear();
-        self.corrections.resize(n, DVec3::ZERO);
+        let relativity = &self.relativity;
         pairwise(
             &self.pool,
+            n,
             &mut self.correction_partials,
             &mut self.corrections,
-            |rows, out| {
-                for i in rows {
-                    for j in i + 1..n {
-                        let r_ij = pos[j] - pos[i];
-                        let inverse_distance = r_ij.length().recip();
-                        out[i] += correction(i, j, r_ij, inverse_distance);
-                        out[j] += correction(j, i, -r_ij, inverse_distance);
-                    }
-                }
-            },
+            |rows, out| accumulate_corrections(rows, input, relativity, out),
         );
 
-        for (a, correction) in acc.iter_mut().zip(&self.corrections) {
-            *a += *correction / (C * C);
+        let [x, y, z] = &self.corrections;
+        for (i, a) in acc.iter_mut().enumerate() {
+            *a += G / (C * C) * DVec3::new(x[i], y[i], z[i]);
         }
     }
 }
@@ -261,41 +224,52 @@ fn add_oblateness(bodies: &Bodies, pos: &[DVec3], acc: &mut [DVec3]) {
     }
 }
 
-/// Runs `kernel(rows, out)` over the rows 0..out.len(), where row i visits the pairs (i, j > i)
-/// and may add to any element of `out`. With a thread pool, each thread takes a block of rows with
-/// an equal share of the pairs and adds into its own buffer, and the buffers are summed into `out`.
-fn pairwise<T>(
+/// Runs `kernel(rows, out)` over the rows 0..n, where row i visits the pairs (i, j > i) and may
+/// add to any element of the K output columns, which are padded like [`KernelInput`]. With a
+/// thread pool, each thread takes a block of rows with an equal share of the pairs and adds into
+/// its own buffer, and the buffers are summed into `out`.
+fn pairwise<const K: usize>(
     pool: &Option<ThreadPool>,
-    partials: &mut Vec<Vec<T>>,
-    out: &mut [T],
-    kernel: impl Fn(Range<usize>, &mut [T]) + Sync,
-) where
-    T: Copy + Default + Send + Sync + std::ops::AddAssign,
-{
-    let n = out.len();
+    n: usize,
+    partials: &mut Vec<[Vec<f64>; K]>,
+    out: &mut [Vec<f64>; K],
+    kernel: impl Fn(Range<usize>, &mut [Vec<f64>; K]) + Sync,
+) {
+    let padded = n + LANES - 1;
+    let reset = |columns: &mut [Vec<f64>; K]| {
+        for column in columns {
+            column.clear();
+            column.resize(padded, 0.0);
+        }
+    };
+    reset(out);
+
     let Some(pool) = pool else {
         kernel(0..n, out);
         return;
     };
-
     pool.install(|| {
         let blocks = balanced_row_blocks(n, pool.current_num_threads());
-        partials.resize_with(blocks.len(), Vec::new);
+        partials.resize_with(blocks.len(), || std::array::from_fn(|_| Vec::new()));
         partials
             .par_iter_mut()
             .zip(blocks)
             .for_each(|(partial, rows)| {
-                partial.clear();
-                partial.resize(n, T::default());
+                reset(partial);
                 kernel(rows, partial);
             });
 
         let partials = &*partials;
-        out.par_iter_mut().enumerate().for_each(|(i, value)| {
-            for partial in partials {
-                *value += partial[i];
-            }
-        });
+        for (c, column) in out.iter_mut().enumerate() {
+            column
+                .par_chunks_mut(SUM_CHUNK)
+                .enumerate()
+                .for_each(|(k, chunk)| {
+                    for (i, value) in (k * SUM_CHUNK..).zip(chunk) {
+                        *value = partials.iter().map(|p| p[c][i]).sum();
+                    }
+                });
+        }
     });
 }
 
@@ -309,6 +283,14 @@ fn sum_partials(partials: &[Columns], first: usize, acc: &mut [DVec3]) {
 
 /// Bodies per SIMD register
 const LANES: usize = 4;
+
+/// Bodies per task when summing the threads' buffers in parallel
+const SUM_CHUNK: usize = 64;
+
+/// Coordinate of the dummy bodies that pad the kernels' input. It's far enough that the pull
+/// of a dummy is negligible even before it's multiplied by its zero mass, but not so far that the
+/// relativity terms overflow, which would turn 0 * inf into NaN.
+const FAR: f64 = 1E100;
 
 /// One array per vector component, so the values of 4 neighbouring bodies load straight
 /// into a SIMD register.
@@ -330,11 +312,19 @@ impl Columns {
             column.resize(len, value);
         }
     }
+
+    /// Copies `values`, padded with `pad` up to `len`
+    fn load(&mut self, values: &[DVec3], len: usize, pad: f64) {
+        self.fill(len, pad);
+        for (i, v) in values.iter().enumerate() {
+            (self.x[i], self.y[i], self.z[i]) = (v.x, v.y, v.z);
+        }
+    }
 }
 
 /// The kernel's copy of the bodies, padded with dummy bodies up to a whole SIMD register past
 /// the last one, so every row can be processed in whole chunks of [`LANES`]. The dummies are
-/// massless and so far away that their pull comes out as exactly 0, and they never touch anything.
+/// massless and [`FAR`] away, so their pull comes out as exactly 0, and they never touch anything.
 #[derive(Default)]
 struct KernelInput {
     len: usize,
@@ -348,15 +338,34 @@ impl KernelInput {
         let padded = pos.len() + LANES - 1;
         self.len = pos.len();
 
-        self.pos.fill(padded, f64::MAX);
-        for (i, p) in pos.iter().enumerate() {
-            (self.pos.x[i], self.pos.y[i], self.pos.z[i]) = (p.x, p.y, p.z);
-        }
+        self.pos.load(pos, padded, FAR);
         for (column, values) in [(&mut self.mass, mass), (&mut self.radius, radius)] {
             column.clear();
             column.extend_from_slice(values);
             column.resize(padded, 0.0);
         }
+    }
+}
+
+/// The rest of the relativity kernel's input, padded like [`KernelInput`] with dummies that
+/// stand still
+#[derive(Default)]
+struct RelativityInput {
+    vel: Columns,
+    /// Accelerations without relativity
+    acc: Columns,
+    speed_sq: Vec<f64>,
+    potential: [Vec<f64>; 1],
+}
+
+impl RelativityInput {
+    fn load(&mut self, vel: &[DVec3], acc: &[DVec3]) {
+        let padded = vel.len() + LANES - 1;
+        self.vel.load(vel, padded, 0.0);
+        self.acc.load(acc, padded, 0.0);
+        self.speed_sq.clear();
+        self.speed_sq.extend(vel.iter().map(|v| v.length_squared()));
+        self.speed_sq.resize(padded, 0.0);
     }
 }
 
@@ -368,6 +377,219 @@ fn load(column: &[f64], j: usize) -> f64x4 {
 fn subtract(column: &mut [f64], j: usize, value: f64x4) {
     let lanes: &mut [f64; LANES] = (&mut column[j..j + LANES]).try_into().unwrap();
     *lanes = (f64x4::new(*lanes) - value).to_array();
+}
+
+/// column[j..j + 4] += value
+fn add(column: &mut [f64], j: usize, value: f64x4) {
+    let lanes: &mut [f64; LANES] = (&mut column[j..j + LANES]).try_into().unwrap();
+    *lanes = (f64x4::new(*lanes) + value).to_array();
+}
+
+/// A 3D vector per SIMD lane
+#[derive(Clone, Copy)]
+struct Lanes3 {
+    x: f64x4,
+    y: f64x4,
+    z: f64x4,
+}
+
+impl Lanes3 {
+    const ZERO: Lanes3 = Lanes3 {
+        x: f64x4::ZERO,
+        y: f64x4::ZERO,
+        z: f64x4::ZERO,
+    };
+
+    /// Body i's vector in every lane
+    fn splat(columns: &Columns, i: usize) -> Self {
+        Lanes3 {
+            x: f64x4::splat(columns.x[i]),
+            y: f64x4::splat(columns.y[i]),
+            z: f64x4::splat(columns.z[i]),
+        }
+    }
+
+    /// The vectors of bodies j..j + 4
+    fn load(columns: &Columns, j: usize) -> Self {
+        Lanes3 {
+            x: load(&columns.x, j),
+            y: load(&columns.y, j),
+            z: load(&columns.z, j),
+        }
+    }
+
+    fn dot(self, other: Self) -> f64x4 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    /// The sum over the lanes
+    fn reduce_add(self) -> DVec3 {
+        DVec3::new(
+            self.x.reduce_add(),
+            self.y.reduce_add(),
+            self.z.reduce_add(),
+        )
+    }
+
+    /// columns[c][j..j + 4] += component c
+    fn add_to(self, columns: &mut [Vec<f64>; 3], j: usize) {
+        let [x, y, z] = columns;
+        add(x, j, self.x);
+        add(y, j, self.y);
+        add(z, j, self.z);
+    }
+}
+
+impl std::ops::Add for Lanes3 {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        Lanes3 {
+            x: self.x + o.x,
+            y: self.y + o.y,
+            z: self.z + o.z,
+        }
+    }
+}
+
+impl std::ops::Sub for Lanes3 {
+    type Output = Self;
+    fn sub(self, o: Self) -> Self {
+        Lanes3 {
+            x: self.x - o.x,
+            y: self.y - o.y,
+            z: self.z - o.z,
+        }
+    }
+}
+
+impl std::ops::Mul<f64x4> for Lanes3 {
+    type Output = Self;
+    fn mul(self, s: f64x4) -> Self {
+        Lanes3 {
+            x: self.x * s,
+            y: self.y * s,
+            z: self.z * s,
+        }
+    }
+}
+
+impl std::ops::AddAssign for Lanes3 {
+    fn add_assign(&mut self, o: Self) {
+        *self = *self + o;
+    }
+}
+
+/// Adds m_j / r_ij to `potential[i]` and m_i / r_ij to `potential[j]` for the pairs (i, j > i)
+/// in `rows`, 4 pairs at a time: the Newtonian potential without the factor G
+fn accumulate_potential(rows: Range<usize>, input: &KernelInput, potential: &mut [f64]) {
+    let KernelInput {
+        len: n,
+        ref pos,
+        ref mass,
+        ..
+    } = *input;
+
+    for i in rows {
+        let (r_i, mass_i) = (Lanes3::splat(pos, i), f64x4::splat(mass[i]));
+        let mut potential_i = f64x4::ZERO;
+
+        for j in (i + 1..n).step_by(LANES) {
+            let r_ij = Lanes3::load(pos, j) - r_i;
+            let inverse_distance = f64x4::ONE / r_ij.dot(r_ij).sqrt();
+            potential_i += load(mass, j) * inverse_distance;
+            add(potential, j, mass_i * inverse_distance);
+        }
+
+        potential[i] += potential_i.reduce_add();
+    }
+}
+
+/// Adds the EIH corrections between body i and every later body j, for i in `rows`, into `out`
+/// (without the factor G / c^2), 4 pairs at a time. Each pair is computed once and applied to
+/// both bodies. With r_ij = r_j - r_i, phi the Newtonian potential and a the Newtonian
+/// acceleration, the correction on body i from body j is
+///
+/// m_j / r^3 * (scale_ij * r_ij - (r_ij . (4 v_i - 3 v_j)) (v_i - v_j)) + 3.5 m_j / r * a_j
+///
+/// scale_ij = v_i^2 + 2 v_j^2 - 4 v_i . v_j - 4 phi_i - phi_j - 1.5 (r_ij . v_j / r)^2
+///            + 0.5 r_ij . a_j
+fn accumulate_corrections(
+    rows: Range<usize>,
+    input: &KernelInput,
+    relativity: &RelativityInput,
+    out: &mut [Vec<f64>; 3],
+) {
+    let KernelInput {
+        len: n,
+        ref pos,
+        ref mass,
+        ..
+    } = *input;
+    let RelativityInput {
+        ref vel,
+        ref acc,
+        ref speed_sq,
+        potential: [ref potential],
+    } = *relativity;
+    let splat = f64x4::splat;
+    let (half, one_and_half, three, three_and_half, four) =
+        (splat(0.5), splat(1.5), splat(3.0), splat(3.5), splat(4.0));
+
+    for i in rows {
+        let (r_i, v_i, a_i) = (
+            Lanes3::splat(pos, i),
+            Lanes3::splat(vel, i),
+            Lanes3::splat(acc, i),
+        );
+        let (mass_i, speed_sq_i, potential_i) =
+            (splat(mass[i]), splat(speed_sq[i]), splat(potential[i]));
+        // Body i's sums are kept in registers, one partial sum per lane
+        let mut correction_i = Lanes3::ZERO;
+
+        for j in (i + 1..n).step_by(LANES) {
+            let r_ij = Lanes3::load(pos, j) - r_i;
+            let (v_j, a_j) = (Lanes3::load(vel, j), Lanes3::load(acc, j));
+            let (mass_j, speed_sq_j, potential_j) =
+                (load(mass, j), load(speed_sq, j), load(potential, j));
+
+            let inverse_distance = f64x4::ONE / r_ij.dot(r_ij).sqrt();
+            let inverse_distance_sq = inverse_distance * inverse_distance;
+            let inverse_distance_cubed = inverse_distance_sq * inverse_distance;
+
+            let (r_dot_v_i, r_dot_v_j) = (r_ij.dot(v_i), r_ij.dot(v_j));
+            let (r_dot_a_i, r_dot_a_j) = (r_ij.dot(a_i), r_ij.dot(a_j));
+            let relative_v = v_i - v_j;
+            // The part of scale that's the same both ways
+            let shared = speed_sq_i + speed_sq_j - four * v_i.dot(v_j);
+
+            // On i from j
+            let scale = shared + speed_sq_j
+                - four * potential_i
+                - potential_j
+                - one_and_half * r_dot_v_j * r_dot_v_j * inverse_distance_sq
+                + half * r_dot_a_j;
+            let along_v = four * r_dot_v_i - three * r_dot_v_j;
+            correction_i += (r_ij * scale - relative_v * along_v)
+                * (mass_j * inverse_distance_cubed)
+                + a_j * (three_and_half * mass_j * inverse_distance);
+
+            // On j from i, where r_ji = -r_ij and v_j - v_i = -relative_v
+            let scale = shared + speed_sq_i
+                - four * potential_j
+                - potential_i
+                - one_and_half * r_dot_v_i * r_dot_v_i * inverse_distance_sq
+                - half * r_dot_a_i;
+            let along_v = four * r_dot_v_j - three * r_dot_v_i;
+            let correction_j = a_i * (three_and_half * mass_i * inverse_distance)
+                - (r_ij * scale + relative_v * along_v) * (mass_i * inverse_distance_cubed);
+            correction_j.add_to(out, j);
+        }
+
+        let sum = correction_i.reduce_add();
+        out[0][i] += sum.x;
+        out[1][i] += sum.y;
+        out[2][i] += sum.z;
+    }
 }
 
 /// Adds the pull between body i and every later body j, for i in `rows`, into `acc`
@@ -619,6 +841,77 @@ mod tests {
             (correction - expected).length() <= 1e-6 * expected.length(),
             "{correction} vs {expected}"
         );
+    }
+
+    /// The EIH corrections one body at a time, straight from the formula (with `newtonian` as
+    /// the accelerations inside it), divided by c^2
+    fn reference_corrections(bodies: &Bodies, newtonian: &[DVec3]) -> Vec<DVec3> {
+        let (pos, vel) = (&bodies.position, &bodies.velocity);
+        let n = bodies.len();
+        let gm = |j: usize| G * bodies.mass[j];
+        let potential: Vec<f64> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .filter(|&j| j != i)
+                    .map(|j| gm(j) / pos[i].distance(pos[j]))
+                    .sum()
+            })
+            .collect();
+
+        (0..n)
+            .map(|i| {
+                let correction: DVec3 = (0..n)
+                    .filter(|&j| j != i)
+                    .map(|j| {
+                        let (v_i, v_j, a_j) = (vel[i], vel[j], newtonian[j]);
+                        let r_ij = pos[j] - pos[i];
+                        let r = r_ij.length();
+                        let scale = -4.0 * potential[i] - potential[j]
+                            + v_i.length_squared()
+                            + 2.0 * v_j.length_squared()
+                            - 4.0 * v_i.dot(v_j)
+                            - 1.5 * (r_ij.dot(v_j) / r).powi(2)
+                            + 0.5 * r_ij.dot(a_j);
+                        gm(j) / r.powi(3)
+                            * (scale * r_ij - r_ij.dot(4.0 * v_i - 3.0 * v_j) * (v_i - v_j))
+                            + 3.5 * gm(j) / r * a_j
+                    })
+                    .sum();
+                correction / (C * C)
+            })
+            .collect()
+    }
+
+    /// Covers every body count modulo the SIMD width, and threads
+    #[test]
+    fn relativity_matches_reference() {
+        let relativity = Physics {
+            oblateness: false,
+            relativity: true,
+        };
+        for extra in [0, 1, 2, 3, 200] {
+            let bodies = test_system(extra);
+            let (pos, vel) = (&bodies.position, &bodies.velocity);
+
+            for threads in [1, 3] {
+                let n = bodies.len();
+                let (mut newtonian, mut full) = (vec![DVec3::ZERO; n], vec![DVec3::ZERO; n]);
+                Forces::new(threads, Physics::NEWTONIAN).compute(&bodies, pos, vel, &mut newtonian);
+                Forces::new(threads, relativity).compute(&bodies, pos, vel, &mut full);
+                let expected = reference_corrections(&bodies, &newtonian);
+
+                for i in 0..n {
+                    let correction = full[i] - newtonian[i];
+                    // Rounding the corrections into the much larger accelerations leaves
+                    // about 1e-8 of them, relative to themselves
+                    assert!(
+                        (correction - expected[i]).length() <= 1e-6 * expected[i].length(),
+                        "n={n}, threads={threads}, body {i}: {correction} vs {}",
+                        expected[i]
+                    );
+                }
+            }
+        }
     }
 
     /// The bulges pull back on their planets, so the total force stays zero
