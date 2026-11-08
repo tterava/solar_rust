@@ -35,8 +35,11 @@ impl SolarApp {
             .wgpu_render_state
             .as_ref()
             .expect("The 3D view needs eframe's wgpu renderer");
-        render::init(render_state);
         let bodies = ephemeris::solar_system();
+        render::init(
+            render_state,
+            bodies.info.iter().map(|b| b.name.clone()).collect(),
+        );
 
         let mut app = SolarApp {
             engine: Engine::new(bodies, Status::default(), PUBLISH_RATE),
@@ -51,6 +54,7 @@ impl SolarApp {
             }),
             overlay: ui::Overlay::default(),
         };
+        app.overlay.credits = render::textures::any_present();
         app.engine.read_latest(&mut app.view);
         app.follow_from_environment();
         app
@@ -117,6 +121,7 @@ impl eframe::App for SolarApp {
                 &self.view.bodies,
                 &self.camera,
                 rect,
+                render::rotation::days_since_j2000(self.view.status.time_elapsed),
                 &mut self.scene,
                 &mut self.targets,
             );

@@ -1,11 +1,15 @@
 //! What to draw this frame, worked out on the CPU from the simulation's snapshot and the camera.
 //! Reads the bodies and never changes them.
 
+use std::sync::Arc;
+
 use egui::{Pos2, Rect};
-use glam::{DVec3, Mat4, Vec4};
+use glam::{DMat3, DVec3, Mat4, Vec4};
 
 use solar_rust::astronomy::Bodies;
 
+use super::rotation;
+use super::textures::srgb_to_linear;
 use crate::camera::Camera;
 use crate::ui::Target;
 
@@ -31,7 +35,12 @@ pub struct Instance {
     pub emissive: f32,
     /// Unit vector towards the Sun
     pub light: [f32; 3],
-    pub _padding: f32,
+    /// 1 if the body's texture is drawn instead of its color. Set by the renderer, which knows
+    /// which textures have loaded.
+    pub textured: f32,
+    /// The body-fixed axes in the view frame: towards the prime meridian on the equator, towards
+    /// 90° east, and towards the north pole
+    pub axes: [[f32; 3]; 3],
 }
 
 /// Per-frame values shared by every instance
@@ -48,6 +57,8 @@ pub struct Uniforms {
 #[derive(Default)]
 pub struct Scene {
     pub instances: Vec<Instance>,
+    /// The body each instance is, for finding its texture
+    pub names: Vec<Arc<str>>,
     pub projection: Mat4,
 }
 
@@ -76,27 +87,20 @@ fn projection(horizontal_fov_degrees: f64, aspect: f64) -> Mat4 {
     )
 }
 
-fn srgb_to_linear(value: u8) -> f32 {
-    let c = value as f32 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-/// Fills `scene` with the bodies as seen by `camera` in `viewport` (points), and `targets` with
-/// where they are on screen for clicking, farthest first.
+/// Fills `scene` with the bodies as seen by `camera` in `viewport` (points), `days` after J2000
+/// TDB, and `targets` with where they are on screen for clicking, farthest first.
 pub fn build(
     bodies: &Bodies,
     camera: &Camera,
     viewport: Rect,
+    days: f64,
     scene: &mut Scene,
     targets: &mut Vec<Target>,
 ) {
     let (width, height) = (viewport.width() as f64, viewport.height() as f64);
     scene.projection = projection(camera.fov, width / height.max(1.0));
     scene.instances.clear();
+    scene.names.clear();
     targets.clear();
 
     // Points on screen per unit of x / depth
@@ -137,14 +141,18 @@ pub fn build(
             _ => DVec3::ZERO,
         };
         let [r, g, b] = info.color.map(srgb_to_linear);
+        let orientation = rotation::orientation(&info.name, days).unwrap_or(DMat3::IDENTITY);
+        let axes = rotation * orientation;
         scene.instances.push(Instance {
             center: center.as_vec3().into(),
             radius: radius as f32,
             color: [r, g, b],
             emissive: if Some(i) == sun { 1.0 } else { 0.0 },
             light: light.as_vec3().into(),
-            _padding: 0.0,
+            textured: 0.0,
+            axes: [axes.x_axis, axes.y_axis, axes.z_axis].map(|axis| axis.as_vec3().into()),
         });
+        scene.names.push(info.name.clone());
 
         if depth > 0.0 {
             let screen = Pos2::new(
@@ -172,6 +180,8 @@ mod tests {
     use super::*;
     use solar_rust::ephemeris::solar_system;
 
+    const DAYS: f64 = 9496.5;
+
     fn viewport() -> Rect {
         Rect::from_min_size(Pos2::new(10.0, 20.0), egui::vec2(800.0, 600.0))
     }
@@ -182,7 +192,7 @@ mod tests {
         let bodies = solar_system();
         let camera = Camera::default();
         let (mut scene, mut targets) = (Scene::default(), Vec::new());
-        build(&bodies, &camera, viewport(), &mut scene, &mut targets);
+        build(&bodies, &camera, viewport(), DAYS, &mut scene, &mut targets);
         assert!(targets.len() > 10);
 
         let rotation = camera.view_rotation();
@@ -219,7 +229,7 @@ mod tests {
         let (mut scene, mut targets) = (Scene::default(), Vec::new());
 
         // From the default view everything is small, so magnified within the limits
-        build(&bodies, &camera, viewport(), &mut scene, &mut targets);
+        build(&bodies, &camera, viewport(), DAYS, &mut scene, &mut targets);
         for target in &targets {
             assert!(
                 (MIN_RADIUS as f32 - 1e-3..=MAX_MAGNIFIED_RADIUS as f32 + 1e-3)
@@ -232,7 +242,7 @@ mod tests {
         // Close up, the Earth is drawn at its true size
         camera.target = bodies.position[earth];
         camera.distance = 10.0 * bodies.radius[earth];
-        build(&bodies, &camera, viewport(), &mut scene, &mut targets);
+        build(&bodies, &camera, viewport(), DAYS, &mut scene, &mut targets);
         let target = targets
             .iter()
             .find(|t| t.id == bodies.info[earth].id)
@@ -250,6 +260,7 @@ mod tests {
             &bodies,
             &Camera::default(),
             viewport(),
+            DAYS,
             &mut scene,
             &mut targets,
         );

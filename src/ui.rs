@@ -11,6 +11,9 @@ use solar_rust::integration::IntegrationMethod;
 const TEXT_REFRESH: Duration = Duration::from_millis(500);
 const LINE_HEIGHT: f32 = 16.0;
 const MARGIN: f32 = 5.0;
+/// Shown while any surface maps are in use. Solar System Scope's license (CC BY 4.0) asks for it.
+const TEXTURE_CREDITS: &str =
+    "Surface maps: NASA, JPL, USGS, ESA/DLR/FU Berlin, Solar System Scope (CC BY 4.0)";
 
 /// A body as drawn on screen, used for click hit-testing
 pub struct Target {
@@ -45,6 +48,8 @@ pub struct Overlay {
     description: Vec<String>,
     next_refresh: Instant,
     shown_for: Option<(Controls, Option<BodyId>)>,
+    /// Whether to credit the surface maps
+    pub credits: bool,
 }
 
 /// The status values the user controls directly
@@ -74,6 +79,7 @@ impl Default for Overlay {
             description: Vec::new(),
             next_refresh: Instant::now(),
             shown_for: None,
+            credits: false,
         }
     }
 }
@@ -125,6 +131,16 @@ impl Overlay {
                 rect.min.y + MARGIN + i as f32 * LINE_HEIGHT,
             );
             painter.text(pos, Align2::LEFT_TOP, line, font.clone(), white);
+        }
+
+        if self.credits {
+            painter.text(
+                rect.max - egui::vec2(MARGIN, MARGIN),
+                Align2::RIGHT_BOTTOM,
+                TEXTURE_CREDITS,
+                FontId::proportional(11.0),
+                Color32::from_gray(110),
+            );
         }
     }
 }

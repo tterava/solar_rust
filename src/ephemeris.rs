@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use glam::DVec3;
+use glam::{DMat3, DVec3};
 
 use crate::astronomy::{Bodies, NewBody, Oblateness};
 use crate::forces::G;
@@ -226,16 +226,16 @@ const OBLATENESS: &[(&str, f64, [f64; 3], f64, f64)] = &[
 /// the ecliptic. Horizons uses this value for its ecliptic frame.
 const OBLIQUITY_DEGREES: f64 = 84381.448 / 3600.0;
 
+/// Rotates equatorial (ICRF) vectors into the ecliptic frame
+pub fn equatorial_to_ecliptic() -> DMat3 {
+    DMat3::from_rotation_x(-OBLIQUITY_DEGREES.to_radians())
+}
+
 /// Unit vector in the ecliptic frame, from equatorial (ICRF) right ascension and declination
 pub fn from_equatorial(ra_degrees: f64, dec_degrees: f64) -> DVec3 {
     let (ra, dec) = (ra_degrees.to_radians(), dec_degrees.to_radians());
     let equatorial = DVec3::new(dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin());
-    let (sin_e, cos_e) = OBLIQUITY_DEGREES.to_radians().sin_cos();
-    DVec3::new(
-        equatorial.x,
-        cos_e * equatorial.y + sin_e * equatorial.z,
-        -sin_e * equatorial.y + cos_e * equatorial.z,
-    )
+    equatorial_to_ecliptic() * equatorial
 }
 
 fn oblateness(name: &str) -> Option<Oblateness> {

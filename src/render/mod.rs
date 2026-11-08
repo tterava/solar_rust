@@ -5,11 +5,15 @@
 //! `prepare` step, then copied into egui's frame where the central panel is. egui's own render
 //! pass has no depth buffer, and this way the scene's depth format and multisampling are ours.
 
+pub mod rotation;
 pub mod scene;
+pub mod textures;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui_wgpu::{self, wgpu, CallbackResources, CallbackTrait, ScreenDescriptor};
 use egui::{Painter, Rect};
@@ -20,10 +24,19 @@ use scene::{Instance, Scene, Uniforms};
 const SAMPLES: u32 = 4;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// Textures uploaded per frame at most, so a burst of finished loads doesn't stall a frame
+const UPLOADS_PER_FRAME: usize = 2;
 
-/// Creates the renderer's GPU resources. Call once at startup.
-pub fn init(render_state: &egui_wgpu::RenderState) {
-    let renderer = SceneRenderer::new(&render_state.device, render_state.target_format);
+/// Creates the renderer's GPU resources and starts loading the textures of `bodies`. Call once at
+/// startup.
+pub fn init(render_state: &egui_wgpu::RenderState, bodies: Vec<Arc<str>>) {
+    let mut renderer = SceneRenderer::new(
+        &render_state.device,
+        &render_state.queue,
+        render_state.target_format,
+    );
+    renderer.loader = Some(Mutex::new(textures::spawn_loader(bodies)));
     render_state
         .renderer
         .write()
@@ -44,6 +57,7 @@ pub struct Capture {
 pub fn paint(painter: &Painter, rect: Rect, scene: &Scene, capture: Option<Capture>) {
     let callback = SceneCallback {
         instances: scene.instances.clone(),
+        names: scene.names.clone(),
         projection: scene.projection,
         rect,
         capture,
@@ -53,6 +67,7 @@ pub fn paint(painter: &Painter, rect: Rect, scene: &Scene, capture: Option<Captu
 
 struct SceneCallback {
     instances: Vec<Instance>,
+    names: Vec<Arc<str>>,
     projection: Mat4,
     rect: Rect,
     capture: Option<Capture>,
@@ -76,7 +91,16 @@ impl CallbackTrait for SceneCallback {
         if let Some(pending) = renderer.pending_capture.take() {
             pending.save(device);
         }
-        renderer.render(device, queue, encoder, size, &self.instances, &uniforms);
+        renderer.upload_textures(device, queue);
+        renderer.render(
+            device,
+            queue,
+            encoder,
+            size,
+            &self.instances,
+            &self.names,
+            &uniforms,
+        );
         if let Some(capture) = &self.capture {
             if !capture.done.load(Ordering::Relaxed) {
                 renderer.pending_capture = Some(renderer.copy_out(device, encoder, capture));
@@ -161,14 +185,23 @@ struct SceneRenderer {
     uniform_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
+    /// This frame's instances, with `textured` filled in
+    upload: Vec<Instance>,
     blit_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    texture_layout: wgpu::BindGroupLayout,
+    texture_sampler: wgpu::Sampler,
+    /// The bind group of every body whose texture has loaded
+    textures: HashMap<Arc<str>, wgpu::BindGroup>,
+    /// For bodies without a texture: one white pixel, which the shader ignores
+    plain: wgpu::BindGroup,
+    loader: Option<Mutex<Receiver<textures::Loaded>>>,
     targets: Option<Targets>,
     pending_capture: Option<PendingCapture>,
 }
 
 impl SceneRenderer {
-    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, target_format: wgpu::TextureFormat) -> Self {
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scene uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -197,14 +230,49 @@ impl SceneRenderer {
             }],
         });
 
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("surface"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        // Longitude wraps around, latitude stops at the poles. Anisotropic filtering keeps the
+        // surface sharp towards the limb, where it's seen at a slant.
+        let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("surface"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 16,
+            ..Default::default()
+        });
+
         let spheres = device.create_shader_module(wgpu::include_wgsl!("spheres.wgsl"));
         let sphere_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("spheres"),
-            bind_group_layouts: &[Some(&uniform_layout)],
+            bind_group_layouts: &[Some(&uniform_layout), Some(&texture_layout)],
             immediate_size: 0,
         });
         let instance_attributes = wgpu::vertex_attr_array![
-            0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32, 4 => Float32x3
+            0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32, 4 => Float32x3,
+            5 => Float32, 6 => Float32x3, 7 => Float32x3, 8 => Float32x3
         ];
         let sphere_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("spheres"),
@@ -310,6 +378,19 @@ impl SceneRenderer {
             ..Default::default()
         });
 
+        let white = textures::Image {
+            width: 1,
+            height: 1,
+            pixels: vec![255; 4],
+        };
+        let (plain_texture, plain) = Self::create_texture(
+            device,
+            &texture_layout,
+            &texture_sampler,
+            "plain",
+            std::slice::from_ref(&white),
+        );
+        write_mips(queue, &plain_texture, std::slice::from_ref(&white));
         let instance_capacity = 256;
         SceneRenderer {
             sphere_pipeline,
@@ -318,10 +399,75 @@ impl SceneRenderer {
             uniform_bind_group,
             instance_buffer: Self::instance_buffer(device, instance_capacity),
             instance_capacity,
+            upload: Vec::new(),
             blit_layout,
             sampler,
+            texture_layout,
+            texture_sampler,
+            textures: HashMap::new(),
+            plain,
+            loader: None,
             targets: None,
             pending_capture: None,
+        }
+    }
+
+    /// Creates a texture from its mip levels, and the bind group to draw with it
+    fn create_texture(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        label: &str,
+        mips: &[textures::Image],
+    ) -> (wgpu::Texture, wgpu::BindGroup) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: mips[0].width,
+                height: mips[0].height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mips.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TEXTURE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        (texture, bind_group)
+    }
+
+    /// Uploads textures the loader has finished
+    fn upload_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let Some(loader) = &mut self.loader else {
+            return;
+        };
+        let loader = loader.get_mut().unwrap();
+        for loaded in loader.try_iter().take(UPLOADS_PER_FRAME) {
+            let (texture, bind_group) = Self::create_texture(
+                device,
+                &self.texture_layout,
+                &self.texture_sampler,
+                &loaded.body,
+                &loaded.mips,
+            );
+            write_mips(queue, &texture, &loaded.mips);
+            self.textures.insert(loaded.body, bind_group);
         }
     }
 
@@ -389,6 +535,7 @@ impl SceneRenderer {
         self.targets.as_ref().unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render(
         &mut self,
         device: &wgpu::Device,
@@ -396,6 +543,7 @@ impl SceneRenderer {
         encoder: &mut wgpu::CommandEncoder,
         size: [u32; 2],
         instances: &[Instance],
+        names: &[Arc<str>],
         uniforms: &Uniforms,
     ) {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
@@ -403,8 +551,18 @@ impl SceneRenderer {
             self.instance_capacity = instances.len().next_power_of_two();
             self.instance_buffer = Self::instance_buffer(device, self.instance_capacity);
         }
-        if !instances.is_empty() {
-            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+        self.upload.clear();
+        self.upload.extend(
+            instances
+                .iter()
+                .zip(names)
+                .map(|(instance, name)| Instance {
+                    textured: self.textures.contains_key(name) as u32 as f32,
+                    ..*instance
+                }),
+        );
+        if !self.upload.is_empty() {
+            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.upload));
         }
 
         self.targets(device, size);
@@ -437,7 +595,12 @@ impl SceneRenderer {
             pass.set_pipeline(&self.sphere_pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-            pass.draw(0..6, 0..instances.len() as u32);
+            // One draw per body, each with its own texture
+            for (i, name) in names.iter().enumerate() {
+                let surface = self.textures.get(name).unwrap_or(&self.plain);
+                pass.set_bind_group(1, surface, &[]);
+                pass.draw(0..6, i as u32..i as u32 + 1);
+            }
         }
     }
 
@@ -488,5 +651,30 @@ impl SceneRenderer {
         render_pass.set_pipeline(&self.blit_pipeline);
         render_pass.set_bind_group(0, &targets.blit_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
+    }
+}
+
+/// Writes every mip level of a texture
+fn write_mips(queue: &wgpu::Queue, texture: &wgpu::Texture, mips: &[textures::Image]) {
+    for (level, mip) in mips.iter().enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &mip.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(mip.width * 4),
+                rows_per_image: Some(mip.height),
+            },
+            wgpu::Extent3d {
+                width: mip.width,
+                height: mip.height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 }
