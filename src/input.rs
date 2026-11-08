@@ -52,6 +52,13 @@ pub fn handle_input(app: &mut SolarApp, ui: &Ui, response: &Response) {
     let pressed = |key| ui.input(|i| i.key_pressed(key));
     let engine = &app.engine;
 
+    // F1: show or hide the controls, Esc: hide them
+    if pressed(Key::F1) {
+        app.help = !app.help;
+    }
+    if pressed(Key::Escape) {
+        app.help = false;
+    }
     if pressed(Key::Space) {
         engine.send(Command::TogglePause);
     }
@@ -90,6 +97,20 @@ pub fn handle_input(app: &mut SolarApp, ui: &Ui, response: &Response) {
     // t: toggle target speed mode
     if pressed(Key::T) {
         engine.send(Command::ToggleTargetSpeed);
+    }
+    // l / e / s: toggle labels, ellipses (orbits) and true scale. p: traces through space, around
+    // what each body orbits, or none
+    if pressed(Key::L) {
+        app.options.labels = !app.options.labels;
+    }
+    if pressed(Key::P) {
+        app.options.traces = app.options.traces.next();
+    }
+    if pressed(Key::E) {
+        app.options.orbits = !app.options.orbits;
+    }
+    if pressed(Key::S) {
+        app.options.true_scale = !app.options.true_scale;
     }
     // o / g: toggle the planets' oblateness and general relativity
     if pressed(Key::O) {

@@ -7,6 +7,8 @@
 
 struct Uniforms {
     projection: mat4x4<f32>,
+    rotation: mat4x4<f32>,
+    viewport: vec2<f32>,
     near: f32,
     // The size of a pixel at distance 1
     pixel: f32,
@@ -23,12 +25,18 @@ struct Instance {
     @location(1) radius: f32,
     @location(2) color: vec3<f32>,
     @location(3) emissive: f32,
+    // The two stars lighting it: directions, and colors scaled by their share of the light
     @location(4) light: vec3<f32>,
     @location(5) textured: f32,
+    @location(6) light_color: vec3<f32>,
+    // 1 for a flat dot, 0 for a shaded sphere
+    @location(7) dot: f32,
+    @location(8) light_2: vec3<f32>,
+    @location(9) light_color_2: vec3<f32>,
     // The body-fixed axes: prime meridian, 90° east, north pole
-    @location(6) axis_x: vec3<f32>,
-    @location(7) axis_y: vec3<f32>,
-    @location(8) axis_z: vec3<f32>,
+    @location(10) axis_x: vec3<f32>,
+    @location(11) axis_y: vec3<f32>,
+    @location(12) axis_z: vec3<f32>,
 }
 
 struct Varyings {
@@ -39,15 +47,21 @@ struct Varyings {
     @location(1) @interpolate(flat) axis: vec3<f32>,
     // Radius, distance, emissive and textured
     @location(2) @interpolate(flat) params: vec4<f32>,
-    @location(3) @interpolate(flat) color: vec3<f32>,
+    // Color, and how much of a dot it is
+    @location(3) @interpolate(flat) color: vec4<f32>,
     @location(4) @interpolate(flat) light: vec3<f32>,
-    @location(5) @interpolate(flat) axis_x: vec3<f32>,
-    @location(6) @interpolate(flat) axis_y: vec3<f32>,
-    @location(7) @interpolate(flat) axis_z: vec3<f32>,
+    @location(5) @interpolate(flat) light_color: vec3<f32>,
+    @location(6) @interpolate(flat) light_2: vec3<f32>,
+    @location(7) @interpolate(flat) light_color_2: vec3<f32>,
+    @location(8) @interpolate(flat) axis_x: vec3<f32>,
+    @location(9) @interpolate(flat) axis_y: vec3<f32>,
+    @location(10) @interpolate(flat) axis_z: vec3<f32>,
 }
 
 // Dim light on the night side, so it isn't completely black
 const AMBIENT: f32 = 0.015;
+// Dots of bodies seen from their night side stay at least this bright, to be found
+const MIN_DOT_LIGHT: f32 = 0.3;
 const PI: f32 = 3.14159265358979;
 
 @vertex
@@ -78,8 +92,11 @@ fn vs(@builtin(vertex_index) index: u32, body: Instance) -> Varyings {
     out.ray = ray;
     out.axis = axis;
     out.params = vec4(radius, distance, body.emissive, body.textured);
-    out.color = body.color;
+    out.color = vec4(body.color, body.dot);
     out.light = body.light;
+    out.light_color = body.light_color;
+    out.light_2 = body.light_2;
+    out.light_color_2 = body.light_color_2;
     out.axis_x = body.axis_x;
     out.axis_y = body.axis_y;
     out.axis_z = body.axis_z;
@@ -135,18 +152,23 @@ fn fs(in: Varyings) -> Fragment {
         discard;
     }
 
-    var base = in.color;
+    var base = in.color.rgb;
     if in.params.w > 0.5 {
         base = texel;
     }
 
     var color: vec3<f32>;
     if in.params.z > 0.5 {
-        // Limb darkening: the Sun's edge is dimmer, since we see shallower, cooler layers there
+        // Limb darkening: a star's edge is dimmer, since we see shallower, cooler layers there
         let facing = max(dot(normal, -direction), 0.0);
         color = base * (0.4 + 0.6 * facing);
     } else {
-        color = base * (max(dot(normal, in.light), 0.0) + AMBIENT);
+        let shaded = max(dot(normal, in.light), 0.0) * in.light_color
+            + max(dot(normal, in.light_2), 0.0) * in.light_color_2 + AMBIENT;
+        // A dot is as bright as the lit part of the disk it stands for
+        let phase = (0.5 + 0.5 * dot(in.light, -in.axis)) * in.light_color
+            + (0.5 + 0.5 * dot(in.light_2, -in.axis)) * in.light_color_2;
+        color = base * mix(shaded, max(phase, vec3(MIN_DOT_LIGHT)), in.color.a);
     }
 
     var out: Fragment;

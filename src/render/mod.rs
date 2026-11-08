@@ -4,10 +4,18 @@
 //! The scene is rendered into our own multisampled color and depth textures during egui's
 //! `prepare` step, then copied into egui's frame where the central panel is. egui's own render
 //! pass has no depth buffer, and this way the scene's depth format and multisampling are ours.
+//!
+//! Drawing order: the background stars, the bodies (opaque, writing depth), then the see-through
+//! things that don't hide what's behind them: traces and orbits, rings, and the glow of stars.
 
+pub mod curves;
+pub mod light;
+pub mod orbits;
 pub mod rotation;
 pub mod scene;
+pub mod sky;
 pub mod textures;
+pub mod traces;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,7 +27,8 @@ use eframe::egui_wgpu::{self, wgpu, CallbackResources, CallbackTrait, ScreenDesc
 use egui::{Painter, Rect};
 use glam::Mat4;
 
-use scene::{Instance, Scene, Uniforms};
+use scene::{Glow, Instance, LineVertex, RingInstance, Scene};
+use textures::Surface;
 
 const SAMPLES: u32 = 4;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -27,6 +36,19 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Textures uploaded per frame at most, so a burst of finished loads doesn't stall a frame
 const UPLOADS_PER_FRAME: usize = 2;
+/// Light adds up
+const ADDITIVE: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
 
 /// Creates the renderer's GPU resources and starts loading the textures of `bodies`. Call once at
 /// startup.
@@ -58,17 +80,28 @@ pub fn paint(painter: &Painter, rect: Rect, scene: &Scene, capture: Option<Captu
     let callback = SceneCallback {
         instances: scene.instances.clone(),
         names: scene.names.clone(),
+        rings: scene.rings.clone(),
+        ring_names: scene.ring_names.clone(),
+        glows: scene.glows.clone(),
+        lines: scene.lines.clone(),
         projection: scene.projection,
+        rotation: scene.rotation,
         rect,
         capture,
     };
     painter.add(egui_wgpu::Callback::new_paint_callback(rect, callback));
 }
 
+/// A frame's worth of the scene, handed to the GPU side
 struct SceneCallback {
     instances: Vec<Instance>,
     names: Vec<Arc<str>>,
+    rings: Vec<RingInstance>,
+    ring_names: Vec<Arc<str>>,
+    glows: Vec<Glow>,
+    lines: Vec<LineVertex>,
     projection: Mat4,
+    rotation: Mat4,
     rect: Rect,
     capture: Option<Capture>,
 }
@@ -85,22 +118,13 @@ impl CallbackTrait for SceneCallback {
         let renderer: &mut SceneRenderer = resources.get_mut().expect("Renderer not initialized");
         let pixels = |points: f32| ((points * screen.pixels_per_point).round() as u32).max(1);
         let size = [pixels(self.rect.width()), pixels(self.rect.height())];
-        let uniforms = scene::uniforms(self.projection, size[1]);
 
         // A copy recorded last frame has been submitted by now
         if let Some(pending) = renderer.pending_capture.take() {
             pending.save(device);
         }
         renderer.upload_textures(device, queue);
-        renderer.render(
-            device,
-            queue,
-            encoder,
-            size,
-            &self.instances,
-            &self.names,
-            &uniforms,
-        );
+        renderer.render(device, queue, encoder, size, self);
         if let Some(capture) = &self.capture {
             if !capture.done.load(Ordering::Relaxed) {
                 renderer.pending_capture = Some(renderer.copy_out(device, encoder, capture));
@@ -178,22 +202,154 @@ impl PendingCapture {
     }
 }
 
+/// A vertex buffer rewritten every frame, grown when it's too small
+struct FrameBuffer {
+    label: &'static str,
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    /// Elements written this frame
+    len: u32,
+}
+
+impl FrameBuffer {
+    fn new(device: &wgpu::Device, label: &'static str) -> Self {
+        let capacity = 4096;
+        FrameBuffer {
+            label,
+            buffer: Self::create(device, label, capacity),
+            capacity,
+            len: 0,
+        }
+    }
+
+    fn create(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn write<T: bytemuck::Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[T]) {
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        if bytes.len() as u64 > self.capacity {
+            self.capacity = (bytes.len() as u64).next_power_of_two();
+            self.buffer = Self::create(device, self.label, self.capacity);
+        }
+        if !bytes.is_empty() {
+            queue.write_buffer(&self.buffer, 0, bytes);
+        }
+        self.len = data.len() as u32;
+    }
+}
+
+/// How a pipeline draws into the scene's targets
+struct Drawing<'a> {
+    label: &'a str,
+    module: &'a wgpu::ShaderModule,
+    layout: &'a wgpu::PipelineLayout,
+    vertex: wgpu::VertexBufferLayout<'a>,
+    topology: wgpu::PrimitiveTopology,
+    blend: Option<wgpu::BlendState>,
+    /// Opaque things write depth and smooth their outlines through alpha to coverage
+    opaque: bool,
+    depth_test: bool,
+}
+
+fn scene_pipeline(device: &wgpu::Device, drawing: Drawing) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(drawing.label),
+        layout: Some(drawing.layout),
+        vertex: wgpu::VertexState {
+            module: drawing.module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[Some(drawing.vertex)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: drawing.topology,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(drawing.opaque),
+            // Reversed-Z: nearer is larger
+            depth_compare: Some(if drawing.depth_test {
+                wgpu::CompareFunction::Greater
+            } else {
+                wgpu::CompareFunction::Always
+            }),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: SAMPLES,
+            mask: !0,
+            alpha_to_coverage_enabled: drawing.opaque,
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: drawing.module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: COLOR_FORMAT,
+                blend: drawing.blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn texture_layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
+    [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
+    ]
+}
+
 struct SceneRenderer {
+    sky_pipeline: wgpu::RenderPipeline,
     sphere_pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
+    ring_pipeline: wgpu::RenderPipeline,
+    glow_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
-    instance_buffer: wgpu::Buffer,
-    instance_capacity: usize,
-    /// This frame's instances, with `textured` filled in
-    upload: Vec<Instance>,
+    sky: wgpu::Buffer,
+    sky_count: u32,
+    instances: FrameBuffer,
+    rings: FrameBuffer,
+    glows: FrameBuffer,
+    lines: FrameBuffer,
+    /// This frame's instances and rings, with `textured` filled in
+    instance_upload: Vec<Instance>,
+    ring_upload: Vec<RingInstance>,
     blit_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     texture_layout: wgpu::BindGroupLayout,
-    texture_sampler: wgpu::Sampler,
-    /// The bind group of every body whose texture has loaded
-    textures: HashMap<Arc<str>, wgpu::BindGroup>,
-    /// For bodies without a texture: one white pixel, which the shader ignores
+    surface_sampler: wgpu::Sampler,
+    ring_sampler: wgpu::Sampler,
+    /// The bind group of every texture that has loaded
+    textures: HashMap<Surface, wgpu::BindGroup>,
+    /// For what has no texture: one white pixel, which the shaders ignore
     plain: wgpu::BindGroup,
     loader: Option<Mutex<Receiver<textures::Loaded>>>,
     targets: Option<Targets>,
@@ -204,7 +360,7 @@ impl SceneRenderer {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, target_format: wgpu::TextureFormat) -> Self {
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scene uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
+            size: std::mem::size_of::<scene::Uniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -232,28 +388,11 @@ impl SceneRenderer {
 
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("surface"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+            entries: &texture_layout_entries(),
         });
         // Longitude wraps around, latitude stops at the poles. Anisotropic filtering keeps the
         // surface sharp towards the limb, where it's seen at a slant.
-        let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let surface_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("surface"),
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -263,78 +402,133 @@ impl SceneRenderer {
             anisotropy_clamp: 16,
             ..Default::default()
         });
+        // Rings stop at their edges
+        let ring_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("rings"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 16,
+            ..Default::default()
+        });
+
+        let layout = |label, textured: bool| {
+            let uniforms = Some(&uniform_layout);
+            let groups = if textured {
+                vec![uniforms, Some(&texture_layout)]
+            } else {
+                vec![uniforms]
+            };
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &groups,
+                immediate_size: 0,
+            })
+        };
+        let plain_layout = layout("scene", false);
+        let textured_layout = layout("textured", true);
+        let instanced = |stride: usize, attributes| wgpu::VertexBufferLayout {
+            array_stride: stride as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes,
+        };
+
+        let sky_module = device.create_shader_module(wgpu::include_wgsl!("sky.wgsl"));
+        let sky_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3];
+        let sky_pipeline = scene_pipeline(
+            device,
+            Drawing {
+                label: "sky",
+                module: &sky_module,
+                layout: &plain_layout,
+                vertex: instanced(std::mem::size_of::<sky::SkyStar>(), &sky_attributes),
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                blend: Some(ADDITIVE),
+                opaque: false,
+                depth_test: false,
+            },
+        );
 
         let spheres = device.create_shader_module(wgpu::include_wgsl!("spheres.wgsl"));
-        let sphere_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("spheres"),
-            bind_group_layouts: &[Some(&uniform_layout), Some(&texture_layout)],
-            immediate_size: 0,
-        });
-        let instance_attributes = wgpu::vertex_attr_array![
+        let sphere_attributes = wgpu::vertex_attr_array![
             0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32, 4 => Float32x3,
-            5 => Float32, 6 => Float32x3, 7 => Float32x3, 8 => Float32x3
+            5 => Float32, 6 => Float32x3, 7 => Float32, 8 => Float32x3, 9 => Float32x3,
+            10 => Float32x3, 11 => Float32x3, 12 => Float32x3
         ];
-        let sphere_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("spheres"),
-            layout: Some(&sphere_layout),
-            vertex: wgpu::VertexState {
+        let sphere_pipeline = scene_pipeline(
+            device,
+            Drawing {
+                label: "spheres",
                 module: &spheres,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Instance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &instance_attributes,
-                })],
+                layout: &textured_layout,
+                vertex: instanced(std::mem::size_of::<Instance>(), &sphere_attributes),
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                blend: None,
+                opaque: true,
+                depth_test: true,
             },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                // Reversed-Z: nearer is larger
-                depth_compare: Some(wgpu::CompareFunction::Greater),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: SAMPLES,
-                mask: !0,
-                alpha_to_coverage_enabled: true,
+        );
+
+        let line_module = device.create_shader_module(wgpu::include_wgsl!("lines.wgsl"));
+        let line_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+        let line_pipeline = scene_pipeline(
+            device,
+            Drawing {
+                label: "lines",
+                module: &line_module,
+                layout: &plain_layout,
+                vertex: wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<LineVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &line_attributes,
+                },
+                topology: wgpu::PrimitiveTopology::LineList,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                opaque: false,
+                depth_test: true,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &spheres,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: COLOR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        );
+
+        let ring_module = device.create_shader_module(wgpu::include_wgsl!("rings.wgsl"));
+        let ring_attributes = wgpu::vertex_attr_array![
+            0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32, 4 => Float32x3,
+            5 => Float32, 6 => Float32x3, 7 => Float32, 8 => Float32x3, 9 => Float32x3,
+            10 => Float32x3
+        ];
+        let ring_pipeline = scene_pipeline(
+            device,
+            Drawing {
+                label: "rings",
+                module: &ring_module,
+                layout: &textured_layout,
+                vertex: instanced(std::mem::size_of::<RingInstance>(), &ring_attributes),
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                opaque: false,
+                depth_test: true,
+            },
+        );
+
+        let glow_module = device.create_shader_module(wgpu::include_wgsl!("glow.wgsl"));
+        let glow_attributes =
+            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3];
+        let glow_pipeline = scene_pipeline(
+            device,
+            Drawing {
+                label: "glow",
+                module: &glow_module,
+                layout: &plain_layout,
+                vertex: instanced(std::mem::size_of::<Glow>(), &glow_attributes),
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                blend: Some(ADDITIVE),
+                opaque: false,
+                depth_test: true,
+            },
+        );
 
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blit"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+            entries: &texture_layout_entries(),
         });
         let blit = device.create_shader_module(wgpu::include_wgsl!("blit.wgsl"));
         let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -378,6 +572,14 @@ impl SceneRenderer {
             ..Default::default()
         });
 
+        let stars = sky::stars();
+        let sky = FrameBuffer::create(
+            device,
+            "sky",
+            std::mem::size_of_val(stars.as_slice()) as u64,
+        );
+        queue.write_buffer(&sky, 0, bytemuck::cast_slice(&stars));
+
         let white = textures::Image {
             width: 1,
             height: 1,
@@ -386,24 +588,34 @@ impl SceneRenderer {
         let (plain_texture, plain) = Self::create_texture(
             device,
             &texture_layout,
-            &texture_sampler,
+            &surface_sampler,
             "plain",
             std::slice::from_ref(&white),
         );
         write_mips(queue, &plain_texture, std::slice::from_ref(&white));
-        let instance_capacity = 256;
+
         SceneRenderer {
+            sky_pipeline,
             sphere_pipeline,
+            line_pipeline,
+            ring_pipeline,
+            glow_pipeline,
             blit_pipeline,
             uniform_buffer,
             uniform_bind_group,
-            instance_buffer: Self::instance_buffer(device, instance_capacity),
-            instance_capacity,
-            upload: Vec::new(),
+            sky,
+            sky_count: stars.len() as u32,
+            instances: FrameBuffer::new(device, "instances"),
+            rings: FrameBuffer::new(device, "rings"),
+            glows: FrameBuffer::new(device, "glows"),
+            lines: FrameBuffer::new(device, "lines"),
+            instance_upload: Vec::new(),
+            ring_upload: Vec::new(),
             blit_layout,
             sampler,
             texture_layout,
-            texture_sampler,
+            surface_sampler,
+            ring_sampler,
             textures: HashMap::new(),
             plain,
             loader: None,
@@ -459,25 +671,16 @@ impl SceneRenderer {
         };
         let loader = loader.get_mut().unwrap();
         for loaded in loader.try_iter().take(UPLOADS_PER_FRAME) {
-            let (texture, bind_group) = Self::create_texture(
-                device,
-                &self.texture_layout,
-                &self.texture_sampler,
-                &loaded.body,
-                &loaded.mips,
-            );
+            let (sampler, label) = match &loaded.surface {
+                Surface::Body(name) => (&self.surface_sampler, name),
+                Surface::Rings(name) => (&self.ring_sampler, name),
+            };
+            let (texture, bind_group) =
+                Self::create_texture(device, &self.texture_layout, sampler, label, &loaded.mips);
             write_mips(queue, &texture, &loaded.mips);
-            self.textures.insert(loaded.body, bind_group);
+            self.textures.insert(loaded.surface, bind_group);
+            textures::uploaded();
         }
-    }
-
-    fn instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("instances"),
-            size: (capacity * std::mem::size_of::<Instance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
     }
 
     fn targets(&mut self, device: &wgpu::Device, size: [u32; 2]) -> &Targets {
@@ -535,35 +738,46 @@ impl SceneRenderer {
         self.targets.as_ref().unwrap()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         size: [u32; 2],
-        instances: &[Instance],
-        names: &[Arc<str>],
-        uniforms: &Uniforms,
+        frame: &SceneCallback,
     ) {
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
-        if instances.len() > self.instance_capacity {
-            self.instance_capacity = instances.len().next_power_of_two();
-            self.instance_buffer = Self::instance_buffer(device, self.instance_capacity);
-        }
-        self.upload.clear();
-        self.upload.extend(
-            instances
+        let uniforms = scene::uniforms(frame.projection, frame.rotation, size);
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        let textures = &self.textures;
+        let textured = |surface: Surface| textures.contains_key(&surface) as u32 as f32;
+        self.instance_upload.clear();
+        self.instance_upload
+            .extend(
+                frame
+                    .instances
+                    .iter()
+                    .zip(&frame.names)
+                    .map(|(instance, name)| Instance {
+                        textured: textured(Surface::Body(name.clone())),
+                        ..*instance
+                    }),
+            );
+        self.ring_upload.clear();
+        self.ring_upload.extend(
+            frame
+                .rings
                 .iter()
-                .zip(names)
-                .map(|(instance, name)| Instance {
-                    textured: self.textures.contains_key(name) as u32 as f32,
-                    ..*instance
+                .zip(&frame.ring_names)
+                .map(|(ring, name)| RingInstance {
+                    textured: textured(Surface::Rings(name.clone())),
+                    ..*ring
                 }),
         );
-        if !self.upload.is_empty() {
-            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.upload));
-        }
+        self.instances.write(device, queue, &self.instance_upload);
+        self.rings.write(device, queue, &self.ring_upload);
+        self.glows.write(device, queue, &frame.glows);
+        self.lines.write(device, queue, &frame.lines);
 
         self.targets(device, size);
         let targets = self.targets.as_ref().unwrap();
@@ -590,17 +804,43 @@ impl SceneRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
 
-        if !instances.is_empty() {
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.set_vertex_buffer(0, self.sky.slice(..));
+        pass.draw(0..6, 0..self.sky_count);
+
+        // One draw per body, each with its own texture
+        if self.instances.len > 0 {
             pass.set_pipeline(&self.sphere_pipeline);
-            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-            // One draw per body, each with its own texture
-            for (i, name) in names.iter().enumerate() {
-                let surface = self.textures.get(name).unwrap_or(&self.plain);
-                pass.set_bind_group(1, surface, &[]);
+            pass.set_vertex_buffer(0, self.instances.buffer.slice(..));
+            for (i, name) in frame.names.iter().enumerate() {
+                let surface = self.textures.get(&Surface::Body(name.clone()));
+                pass.set_bind_group(1, surface.unwrap_or(&self.plain), &[]);
                 pass.draw(0..6, i as u32..i as u32 + 1);
             }
+        }
+
+        if self.lines.len > 0 {
+            pass.set_pipeline(&self.line_pipeline);
+            pass.set_vertex_buffer(0, self.lines.buffer.slice(..));
+            pass.draw(0..self.lines.len, 0..1);
+        }
+
+        if self.rings.len > 0 {
+            pass.set_pipeline(&self.ring_pipeline);
+            pass.set_vertex_buffer(0, self.rings.buffer.slice(..));
+            for (i, name) in frame.ring_names.iter().enumerate() {
+                let strip = self.textures.get(&Surface::Rings(name.clone()));
+                pass.set_bind_group(1, strip.unwrap_or(&self.plain), &[]);
+                pass.draw(0..6, i as u32..i as u32 + 1);
+            }
+        }
+
+        if self.glows.len > 0 {
+            pass.set_pipeline(&self.glow_pipeline);
+            pass.set_vertex_buffer(0, self.glows.buffer.slice(..));
+            pass.draw(0..6, 0..self.glows.len);
         }
     }
 

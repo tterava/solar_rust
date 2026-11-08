@@ -874,6 +874,7 @@ mod tests {
                 oblateness: None,
                 magnification: 1.0,
                 color: [0; 3],
+                emission: Default::default(),
             });
         }
 

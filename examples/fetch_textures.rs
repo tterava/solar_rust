@@ -131,6 +131,21 @@ const SOURCES: &[Source] = &[
         sha256: "f211e4b86601a22df9526cada4a68b3e5061a8a35038fca7e339e2db28edfffb", width: 2048, center_longitude: 150.0, credit: "NASA/JPL-Caltech/UCLA/MPS/DLR/IDA (Dawn)" },
 ];
 
+/// Ring systems: one strip from the inner edge (left) to the outer edge (right), with the rings'
+/// opacity in alpha. Saved as `<body>_ring.png`, one pixel high.
+#[rustfmt::skip]
+const RINGS: &[Source] = &[
+    Source { body: "Saturn", url: "https://www.solarsystemscope.com/textures/download/8k_saturn_ring_alpha.png",
+        sha256: "f1f826933c9ff87d64ecf0518d6256b8ed990b003722794f67e96e3d2b876ae4", width: 4096,
+        center_longitude: 0.0, credit: SSS },
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Map,
+    Ring,
+}
+
 /// Wikimedia asks automated clients to say who they are, and rate limits the rest
 const USER_AGENT: &str = "solar_rust-fetch_textures/0.1 (hobby solar system simulator)";
 const ATTEMPTS: u32 = 4;
@@ -149,30 +164,44 @@ fn main() {
     std::fs::create_dir_all(&directory).expect("Failed to create assets/textures");
 
     let mut failed = Vec::new();
-    for source in SOURCES {
+    let all = SOURCES
+        .iter()
+        .map(|source| (source, Kind::Map))
+        .chain(RINGS.iter().map(|source| (source, Kind::Ring)));
+    for (source, kind) in all {
         let is_named = named.iter().any(|n| n == source.body);
         if !named.is_empty() && !is_named {
             continue;
         }
-        let output = directory.join(file_name(source.body));
+        let (name, label) = match kind {
+            Kind::Map => (file_name(source.body), source.body.to_string()),
+            Kind::Ring => (
+                ring_file_name(source.body),
+                format!("{}'s rings", source.body),
+            ),
+        };
+        let output = directory.join(&name);
         if output.exists() && !force && !is_named {
-            println!("{}: already there", source.body);
+            println!("{label}: already there");
             continue;
         }
-        let download = directory.join(format!("{}.download", file_name(source.body)));
-        let result = fetch(source, &download).and_then(|()| convert(source, &download, &output));
+        let download = directory.join(format!("{name}.download"));
+        let result = fetch(source, &download).and_then(|()| match kind {
+            Kind::Map => convert(source, &download, &output),
+            Kind::Ring => convert_ring(source, &download, &output),
+        });
         let _ = std::fs::remove_file(&download);
         match result {
-            Ok(()) => println!("{}", source.body),
+            Ok(()) => println!("{label}"),
             Err(error) => {
-                eprintln!("{}: {error}", source.body);
-                failed.push(source.body);
+                eprintln!("{label}: {error}");
+                failed.push(label);
             }
         }
     }
 
     println!("\nCredits:");
-    for source in SOURCES {
+    for source in SOURCES.iter().chain(RINGS) {
         println!("  {}: {}", source.body, source.credit);
     }
     if !failed.is_empty() {
@@ -253,6 +282,20 @@ fn convert(source: &Source, path: &Path, output: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Writes the middle row of a ring strip at its target width, keeping the opacity
+fn convert_ring(source: &Source, path: &Path, output: &Path) -> Result<(), String> {
+    let image = ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(|e| e.to_string())?
+        .decode()
+        .map_err(|e| e.to_string())?
+        .into_rgba8();
+    let row = imageops::crop_imm(&image, 0, image.height() / 2, image.width(), 1).to_image();
+    imageops::resize(&row, source.width, 1, FilterType::Lanczos3)
+        .save_with_format(output, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())
+}
+
 /// Pixels this dark are where the source has no data. JPEG noise keeps them from being exactly 0.
 const UNMAPPED: u8 = 8;
 
@@ -285,6 +328,11 @@ fn shift_longitude(image: &RgbImage, center_longitude: f64) -> RgbImage {
         shifted.put_pixel(((x as i64 + shift) % width) as u32, y, *pixel);
     }
     shifted
+}
+
+/// Must match `render::textures::ring_file_name` in the app
+fn ring_file_name(body: &str) -> String {
+    file_name(body).replace(".jpg", "_ring.png")
 }
 
 /// Must match `render::textures::file_name` in the app

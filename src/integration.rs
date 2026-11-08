@@ -230,6 +230,7 @@ mod tests {
                     oblateness: None,
                     magnification: 1.0,
                     color: [0; 3],
+                    emission: Default::default(),
                 });
                 let earth =
                     OrbitalObject::circular("Earth", 5.972168E24, 6371.0E3, AU, 0.0, 1.0, [0; 3]);
@@ -281,6 +282,7 @@ mod tests {
                     oblateness: None,
                     magnification: 1.0,
                     color: [0; 3],
+                    emission: Default::default(),
                 });
             }
             let physics = Physics {

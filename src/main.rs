@@ -3,11 +3,11 @@ mod input;
 mod render;
 mod ui;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use solar_rust::astronomy::BodyId;
-use solar_rust::engine::{Engine, Snapshot, Status};
+use solar_rust::engine::{Command, Engine, Snapshot, Status};
 use solar_rust::ephemeris;
 
 use crate::camera::Camera;
@@ -24,9 +24,21 @@ pub struct SolarApp {
     /// Bodies as drawn last frame, for clicking on them
     targets: Vec<ui::Target>,
     scene: render::scene::Scene,
+    /// What the view shows: labels, traces, orbits, scale
+    options: render::scene::ViewOptions,
+    /// Where bodies have been
+    traces: render::traces::Traces,
     /// Where to save the 3D view once the camera has settled, from SOLAR_CAPTURE
     capture: Option<render::Capture>,
+    /// Not before this, from SOLAR_CAPTURE_AFTER
+    capture_after: Instant,
+    /// How far from the followed body to look from once there (its radii), from SOLAR_DISTANCE
+    distance_radii: Option<f64>,
     overlay: ui::Overlay,
+    /// Whether the controls are shown (F1), from SOLAR_HELP at start
+    help: bool,
+    /// When the app started, for timing traces
+    started: Instant,
 }
 
 impl SolarApp {
@@ -48,21 +60,59 @@ impl SolarApp {
             selected: None,
             targets: Vec::new(),
             scene: render::scene::Scene::default(),
+            options: render::scene::ViewOptions {
+                traces: match std::env::var("SOLAR_TRACES").as_deref() {
+                    Ok("relative") => render::scene::TraceMode::Relative,
+                    Ok("off") => render::scene::TraceMode::Off,
+                    _ => render::scene::TraceMode::Absolute,
+                },
+                ..Default::default()
+            },
+            traces: Default::default(),
             capture: std::env::var_os("SOLAR_CAPTURE").map(|path| render::Capture {
                 path: path.into(),
                 done: Default::default(),
             }),
+            capture_after: Instant::now()
+                + Duration::from_secs_f64(
+                    std::env::var("SOLAR_CAPTURE_AFTER")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0),
+                ),
+            distance_radii: std::env::var("SOLAR_DISTANCE")
+                .ok()
+                .and_then(|s| s.parse().ok()),
             overlay: ui::Overlay::default(),
+            help: std::env::var_os("SOLAR_HELP").is_some(),
+            started: Instant::now(),
         };
         app.overlay.credits = render::textures::any_present();
         app.engine.read_latest(&mut app.view);
         app.follow_from_environment();
+        app.run_from_environment();
         app
     }
 
-    /// Selects the body named in the SOLAR_FOLLOW environment variable, if any. With
-    /// SOLAR_CAPTURE=file.png, the view is then saved to that file and the app closes: handy for
-    /// checking the view without a screenshot.
+    /// With SOLAR_SPEED=<days per second>, the simulation starts running at that speed.
+    /// SOLAR_TRACES=relative|absolute|off picks how traces are drawn.
+    fn run_from_environment(&mut self) {
+        let Some(days) = std::env::var("SOLAR_SPEED")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+        else {
+            return;
+        };
+        let speed = self.view.status.target_speed;
+        self.engine
+            .send(Command::ScaleSpeed(days * 86400.0 / speed));
+        self.engine.send(Command::TogglePause);
+    }
+
+    /// Selects the body named in the SOLAR_FOLLOW environment variable, if any, and looks at it
+    /// from SOLAR_DISTANCE of its radii. With SOLAR_CAPTURE=file.png, the view is then saved to
+    /// that file and the app closes: handy for checking the view without a screenshot. The capture
+    /// waits for the camera to settle, the textures to load, and SOLAR_CAPTURE_AFTER seconds.
     fn follow_from_environment(&mut self) {
         let Ok(name) = std::env::var("SOLAR_FOLLOW") else {
             return;
@@ -89,9 +139,15 @@ impl SolarApp {
         };
 
         match self.view.bodies.index_of(id) {
-            Some(i) => self
-                .camera
-                .follow(self.view.bodies.position[i], self.view.bodies.radius[i]),
+            Some(i) => {
+                let radius = self.view.bodies.radius[i];
+                self.camera.follow(self.view.bodies.position[i], radius);
+                if !self.camera.is_animating() {
+                    if let Some(radii) = self.distance_radii.take() {
+                        self.camera.distance = radii * radius;
+                    }
+                }
+            }
             // Merged into another body in a collision
             None => {
                 self.selected = None;
@@ -117,21 +173,34 @@ impl eframe::App for SolarApp {
             input::handle_input(self, ui, &response);
             self.update_camera();
 
-            render::scene::build(
-                &self.view.bodies,
-                &self.camera,
-                rect,
-                render::rotation::days_since_j2000(self.view.status.time_elapsed),
-                &mut self.scene,
-                &mut self.targets,
-            );
-            // Captured once the fly-to animation is over
-            let capture = self.capture.clone().filter(|_| !self.camera.is_animating());
+            let time = self.view.status.time_elapsed;
+            let parents = self.view.bodies.orbital_parents();
+            let real = self.started.elapsed().as_secs_f64();
+            self.traces.update(&self.view.bodies, &parents, time, real);
+            let view = render::scene::View {
+                bodies: &self.view.bodies,
+                camera: &self.camera,
+                viewport: rect,
+                days: render::rotation::days_since_j2000(time),
+                options: self.options,
+                selected: self.selected,
+                traces: &self.traces,
+                parents: &parents,
+            };
+            render::scene::build(&view, &mut self.scene, &mut self.targets);
+            let settled = !self.camera.is_animating()
+                && render::textures::all_loaded()
+                && Instant::now() >= self.capture_after;
+            let capture = self.capture.clone().filter(|_| settled);
             render::paint(&painter, rect, &self.scene, capture);
+            ui::paint_labels(&painter, rect, &self.scene.labels);
             ui::paint_border(&painter, rect);
-            self.overlay.update(&self.view, self.selected);
+            self.overlay.update(&self.view, self.selected, self.options);
             self.overlay
                 .paint(&painter, rect, self.view.status.use_target_speed);
+            if self.help {
+                ui::paint_help(&painter, rect);
+            }
         });
 
         if let Some(capture) = &self.capture {

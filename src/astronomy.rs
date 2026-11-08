@@ -19,6 +19,18 @@ pub struct BodyInfo {
     pub name: Arc<str>,
     pub color: [u8; 3],
     pub magnification: f64,
+    pub emission: Emission,
+}
+
+/// The light a body gives off, for display. Values left out are worked out from the body's mass
+/// and radius when it's drawn, so a body shines if it's massive enough to be a star or if either
+/// value is given.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Emission {
+    /// Total power radiated, W
+    pub luminosity: Option<f64>,
+    /// Surface temperature, K
+    pub temperature: Option<f64>,
 }
 
 /// A fully specified body, ready to be added to [`Bodies`].
@@ -32,6 +44,7 @@ pub struct NewBody {
     pub oblateness: Option<Oblateness>,
     pub magnification: f64,
     pub color: [u8; 3],
+    pub emission: Emission,
 }
 
 /// Zonal gravity harmonics of a flattened, spinning body. Its equatorial bulge pulls a little
@@ -134,6 +147,7 @@ impl Bodies {
             name: body.name.into(),
             color: body.color,
             magnification: body.magnification,
+            emission: body.emission,
         });
 
         self.len() - 1
@@ -200,27 +214,51 @@ impl Bodies {
         self.info.remove(i);
     }
 
-    /// Finds the body this body is orbiting: one that alone accounts for (nearly) all of its
-    /// acceleration, both in direction and magnitude.
-    pub fn orbital_parent(&self, child: usize) -> Option<usize> {
-        const ALLOWED_ERROR: f64 = 0.1;
+    /// The body each body orbits, if any. A body orbits another if it's bound to it (negative
+    /// two-body orbital energy) and inside its Hill sphere, the region where that body's gravity
+    /// outweighs the tides of what it orbits in turn. Of those, the one with the smallest Hill
+    /// sphere wins, so a moon orbits its planet rather than the star.
+    ///
+    /// Bodies are taken from the most massive down, so each body's own Hill sphere is measured
+    /// against its parent, or against the most massive body if it has none (whose own Hill sphere
+    /// is unlimited). Everything is worked out from the current state, so it follows whatever
+    /// the simulation does: a passing star can pull planets out of their star's Hill sphere, and
+    /// a body flying through unbound orbits nothing.
+    pub fn orbital_parents(&self) -> Vec<Option<usize>> {
+        let mut order: Vec<usize> = (0..self.len()).collect();
+        order.sort_by(|&a, &b| self.mass[b].total_cmp(&self.mass[a]));
+        let Some(&root) = order.first() else {
+            return Vec::new();
+        };
 
-        let child_acc = self.acceleration[child];
-        let child_acc_len = child_acc.length();
-        if child_acc_len == 0.0 {
-            return None;
+        let mut parents = vec![None; self.len()];
+        let mut hill = vec![0.0; self.len()];
+        for (rank, &i) in order.iter().enumerate() {
+            let parent = order[..rank]
+                .iter()
+                .copied()
+                .filter(|&j| self.mass[j] > self.mass[i])
+                .filter(|&j| self.position[i].distance(self.position[j]) < hill[j])
+                .filter(|&j| self.is_bound(i, j))
+                .min_by(|&a, &b| hill[a].total_cmp(&hill[b]));
+            parents[i] = parent;
+            hill[i] = match parent.or((i != root).then_some(root)) {
+                Some(p) => {
+                    let distance = self.position[i].distance(self.position[p]);
+                    distance * (self.mass[i] / (3.0 * self.mass[p])).cbrt()
+                }
+                None => f64::INFINITY,
+            };
         }
-        let child_acc_unit = child_acc / child_acc_len;
+        parents
+    }
 
-        (0..self.len()).filter(|&i| i != child).find(|&i| {
-            let difference = self.position[i] - self.position[child];
-            let distance = difference.length();
-
-            let alignment = difference.dot(child_acc_unit) / distance;
-            let acc_caused = G * self.mass[i] / (distance * distance);
-
-            1.0 - alignment < ALLOWED_ERROR && 1.0 - acc_caused / child_acc_len < ALLOWED_ERROR
-        })
+    /// Whether bodies `i` and `j` are bound to each other, ignoring everything else
+    fn is_bound(&self, i: usize, j: usize) -> bool {
+        let distance = self.position[i].distance(self.position[j]);
+        let speed = (self.velocity[i] - self.velocity[j]).length();
+        let gm = G * (self.mass[i] + self.mass[j]);
+        0.5 * speed * speed < gm / distance
     }
 }
 
@@ -266,6 +304,7 @@ pub struct OrbitalObject {
     pub inclination: Inclination,
     pub magnification: f64,
     pub color: [u8; 3],
+    pub emission: Emission,
 }
 
 impl OrbitalObject {
@@ -288,6 +327,7 @@ impl OrbitalObject {
             inclination: Inclination::Fixed(inclination_deg.to_radians()),
             magnification,
             color,
+            emission: Emission::default(),
         }
     }
 
@@ -309,6 +349,7 @@ impl OrbitalObject {
                 rng.random_range(0..=255),
                 rng.random_range(0..=255),
             ],
+            emission: Emission::default(),
         }
     }
 
@@ -349,6 +390,7 @@ impl OrbitalObject {
             oblateness: None,
             magnification: self.magnification,
             color: self.color,
+            emission: self.emission,
         }
     }
 }
@@ -402,5 +444,71 @@ mod tests {
         // On the equator the bulge pulls inwards
         let equator = shape.pole.any_orthonormal_vector() * 4.2E8;
         assert!(shape.acceleration(gm, equator).dot(equator) < 0.0);
+    }
+
+    fn parent_names(bodies: &Bodies) -> impl Fn(&str) -> Option<String> + '_ {
+        let parents = bodies.orbital_parents();
+        move |child| {
+            let i = bodies.info.iter().position(|b| &*b.name == child).unwrap();
+            parents[i].map(|p| bodies.info[p].name.to_string())
+        }
+    }
+
+    #[test]
+    fn moons_orbit_their_planets() {
+        let bodies = crate::ephemeris::solar_system();
+        let parent_of = parent_names(&bodies);
+        assert_eq!(parent_of("Sun"), None);
+        assert_eq!(parent_of("Earth").as_deref(), Some("Sun"));
+        assert_eq!(parent_of("Moon").as_deref(), Some("Earth"));
+        assert_eq!(parent_of("Phobos").as_deref(), Some("Mars"));
+        // Inside Io's orbit, and Io's own Hill sphere is only about 10,000 km
+        assert_eq!(parent_of("Amalthea").as_deref(), Some("Jupiter"));
+        assert_eq!(parent_of("Europa").as_deref(), Some("Jupiter"));
+        assert_eq!(parent_of("Titan").as_deref(), Some("Saturn"));
+        assert_eq!(parent_of("Charon").as_deref(), Some("Pluto"));
+        assert_eq!(parent_of("Nix").as_deref(), Some("Pluto"));
+        assert_eq!(parent_of("Hektor").as_deref(), Some("Sun"));
+        assert_eq!(parent_of("Halley").as_deref(), Some("Sun"));
+        // On their way out of the solar system
+        assert_eq!(parent_of("Voyager 1"), None);
+        assert_eq!(parent_of("'Oumuamua"), None);
+    }
+
+    /// A neutron star passing at 100 km/s, 10 AU from the Sun: nothing is bound to it, it shrinks
+    /// the Sun's Hill sphere to about 6 AU, and the outer planets orbit nothing while it's there
+    #[test]
+    fn passing_neutron_star() {
+        let mut bodies = crate::ephemeris::solar_system();
+        let sun = bodies.info.iter().position(|b| &*b.name == "Sun").unwrap();
+        let (position, velocity) = (bodies.position[sun], bodies.velocity[sun]);
+        bodies.push(NewBody {
+            name: "Neutron star".into(),
+            mass: 1.4 * 1.989E30,
+            radius: 1.2E4,
+            position: position + DVec3::new(0.0, 0.0, 10.0 * AU),
+            velocity: velocity + DVec3::new(1.0E5, 0.0, 0.0),
+            oblateness: None,
+            magnification: 1.0,
+            color: [255; 3],
+            emission: Emission::default(),
+        });
+        let parent_of = parent_names(&bodies);
+        assert_eq!(parent_of("Neutron star"), None);
+        assert_eq!(parent_of("Sun"), None);
+        assert_eq!(parent_of("Earth").as_deref(), Some("Sun"));
+        assert_eq!(parent_of("Jupiter").as_deref(), Some("Sun"));
+        assert_eq!(parent_of("Moon").as_deref(), Some("Earth"));
+        assert_eq!(parent_of("Titan").as_deref(), Some("Saturn"));
+        assert_eq!(parent_of("Neptune"), None);
+        drop(parent_of);
+
+        // Slowed down to a crawl it captures the Sun, and the planets outside its reach
+        let star = bodies.len() - 1;
+        bodies.velocity[star] = velocity;
+        let parent_of = parent_names(&bodies);
+        assert_eq!(parent_of("Sun").as_deref(), Some("Neutron star"));
+        assert_eq!(parent_of("Neptune").as_deref(), Some("Neutron star"));
+        assert_eq!(parent_of("Earth").as_deref(), Some("Sun"));
     }
 }

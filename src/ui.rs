@@ -8,12 +8,59 @@ use solar_rust::ephemeris;
 use solar_rust::forces::Physics;
 use solar_rust::integration::IntegrationMethod;
 
+use crate::render::scene::{Label, TraceMode, ViewOptions};
+
 const TEXT_REFRESH: Duration = Duration::from_millis(500);
 const LINE_HEIGHT: f32 = 16.0;
 const MARGIN: f32 = 5.0;
 /// Shown while any surface maps are in use. Solar System Scope's license (CC BY 4.0) asks for it.
 const TEXTURE_CREDITS: &str =
     "Surface maps: NASA, JPL, USGS, ESA/DLR/FU Berlin, Solar System Scope (CC BY 4.0)";
+
+/// Mouse and keys, shown with F1: sections of (control, what it does)
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Mouse",
+        &[
+            ("Left click", "Select a body and follow it"),
+            ("Right drag", "Turn the camera around"),
+            ("Scroll", "Zoom (with Shift: 5x faster)"),
+        ],
+    ),
+    (
+        "Simulation",
+        &[
+            ("Space", "Run / pause"),
+            (
+                "+  -",
+                "Faster / slower: the target speed, or the time step",
+            ),
+            ("T", "Target speed mode on / off"),
+            ("M", "Next integration method"),
+            ("O", "Planets' oblateness on / off"),
+            ("G", "General relativity on / off"),
+            ("R", "Add a random planet around the Sun"),
+            ("1 - 9", "Number of threads"),
+            ("Q  W", "One thread fewer / more"),
+        ],
+    ),
+    (
+        "View",
+        &[
+            ("L", "Labels on / off"),
+            (
+                "P",
+                "Traces: absolute (through space), relative (around what each body orbits), off",
+            ),
+            (
+                "E",
+                "Orbits on / off: the faint lines, where each body is headed",
+            ),
+            ("S", "True scale / small bodies magnified"),
+        ],
+    ),
+    ("", &[("F1  Esc", "Show / hide this help")]),
+];
 
 /// A body as drawn on screen, used for click hit-testing
 pub struct Target {
@@ -31,6 +78,40 @@ pub fn hit_test(targets: &[Target], pos: Pos2) -> Option<BodyId> {
         .map(|t| t.id)
 }
 
+/// Space between a body and its label (points)
+const LABEL_GAP: f32 = 4.0;
+/// Labels keep off bodies drawn at least this big (radius in points)
+const LABEL_OBSTACLE: f32 = 5.0;
+
+/// Body names next to the bodies, most important first, leaving out any that would cover a name
+/// already placed or a body big enough to see, except the selected body's
+pub fn paint_labels(painter: &Painter, rect: Rect, labels: &[Label]) {
+    let mut placed: Vec<Rect> = labels
+        .iter()
+        .filter(|label| label.radius >= LABEL_OBSTACLE)
+        .map(|label| Rect::from_center_size(label.center, egui::Vec2::splat(2.0 * label.radius)))
+        .collect();
+    for label in labels {
+        let color = if label.selected {
+            Color32::WHITE
+        } else {
+            Color32::from_gray(170)
+        };
+        let galley =
+            painter.layout_no_wrap(label.name.to_string(), FontId::proportional(12.0), color);
+        let size = galley.size();
+        let corner = label.center + egui::vec2(label.radius + LABEL_GAP, -size.y / 2.0);
+        let area = Rect::from_min_size(corner, size).expand(1.0);
+        // The selected body is always named
+        let blocked = !label.selected && placed.iter().any(|other| other.intersects(area));
+        if blocked || !rect.contains_rect(area) {
+            continue;
+        }
+        placed.push(area);
+        painter.galley(corner, galley, color);
+    }
+}
+
 /// A thin frame around the view
 pub fn paint_border(painter: &Painter, rect: Rect) {
     painter.add(Shape::rect_stroke(
@@ -41,13 +122,82 @@ pub fn paint_border(painter: &Painter, rect: Rect) {
     ));
 }
 
+/// The controls, in a panel over the middle of the view
+pub fn paint_help(painter: &Painter, rect: Rect) {
+    let key_font = FontId::monospace(14.0);
+    let text_font = FontId::proportional(14.0);
+    let heading_font = FontId::proportional(15.0);
+    let (row, padding, gap) = (20.0, 18.0, 16.0);
+    let lay_out = |text: &str, font: &FontId, color| {
+        painter.layout_no_wrap(text.to_owned(), font.clone(), color)
+    };
+
+    let keys: Vec<_> = HELP
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .map(|(key, _)| lay_out(key, &key_font, Color32::WHITE))
+        .collect();
+    let texts: Vec<_> = HELP
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .map(|(_, text)| lay_out(text, &text_font, Color32::from_gray(200)))
+        .collect();
+    let key_width = keys.iter().map(|g| g.size().x).fold(0.0, f32::max);
+    let text_width = texts.iter().map(|g| g.size().x).fold(0.0, f32::max);
+    let headings = HELP.iter().filter(|(h, _)| !h.is_empty()).count();
+    let width = padding * 2.0 + key_width + gap + text_width;
+    let height =
+        padding * 2.0 + row * 1.5 + (keys.len() + headings) as f32 * row + HELP.len() as f32 * 6.0;
+
+    let panel = Rect::from_center_size(rect.center(), egui::vec2(width, height));
+    painter.rect(
+        panel,
+        8.0,
+        Color32::from_black_alpha(240),
+        Stroke::new(1.0, Color32::from_gray(90)),
+        egui::StrokeKind::Inside,
+    );
+
+    let left = panel.min.x + padding;
+    let mut y = panel.min.y + padding;
+    painter.text(
+        Pos2::new(panel.center().x, y),
+        Align2::CENTER_TOP,
+        "Controls",
+        FontId::proportional(18.0),
+        Color32::WHITE,
+    );
+    y += row * 1.5;
+
+    let mut rows = keys.into_iter().zip(texts);
+    for (heading, entries) in HELP {
+        y += 6.0;
+        if !heading.is_empty() {
+            painter.text(
+                Pos2::new(left, y),
+                Align2::LEFT_TOP,
+                heading,
+                heading_font.clone(),
+                Color32::from_rgb(150, 190, 255),
+            );
+            y += row;
+        }
+        for _ in entries.iter() {
+            let (key, text) = rows.next().unwrap();
+            painter.galley(Pos2::new(left, y), key, Color32::WHITE);
+            painter.galley(Pos2::new(left + key_width + gap, y), text, Color32::WHITE);
+            y += row;
+        }
+    }
+}
+
 /// Status (bottom left) and selected body (top left) text. Refreshed twice a second so the
 /// numbers stay readable, and immediately when a setting or the selection changes.
 pub struct Overlay {
     status_lines: Vec<String>,
     description: Vec<String>,
     next_refresh: Instant,
-    shown_for: Option<(Controls, Option<BodyId>)>,
+    shown_for: Option<(Controls, Option<BodyId>, ViewOptions)>,
     /// Whether to credit the surface maps
     pub credits: bool,
 }
@@ -85,15 +235,15 @@ impl Default for Overlay {
 }
 
 impl Overlay {
-    pub fn update(&mut self, view: &Snapshot, selected: Option<BodyId>) {
+    pub fn update(&mut self, view: &Snapshot, selected: Option<BodyId>, options: ViewOptions) {
         let now = Instant::now();
-        let key = (controls(&view.status), selected);
+        let key = (controls(&view.status), selected, options);
 
         if now < self.next_refresh && self.shown_for == Some(key) {
             return;
         }
 
-        self.status_lines = status_text(&view.status, view.bodies.len());
+        self.status_lines = status_text(&view.status, view.bodies.len(), options);
         self.description = selected
             .and_then(|id| view.bodies.index_of(id))
             .map(|i| description_text(&view.bodies, i))
@@ -133,6 +283,14 @@ impl Overlay {
             painter.text(pos, Align2::LEFT_TOP, line, font.clone(), white);
         }
 
+        painter.text(
+            Pos2::new(rect.max.x - MARGIN, rect.min.y + MARGIN),
+            Align2::RIGHT_TOP,
+            "F1: help",
+            FontId::proportional(12.0),
+            Color32::from_gray(140),
+        );
+
         if self.credits {
             painter.text(
                 rect.max - egui::vec2(MARGIN, MARGIN),
@@ -145,7 +303,7 @@ impl Overlay {
     }
 }
 
-fn status_text(status: &Status, body_count: usize) -> Vec<String> {
+fn status_text(status: &Status, body_count: usize, options: ViewOptions) -> Vec<String> {
     let method = match status.method {
         IntegrationMethod::Symplectic(k) => {
             let order = match k {
@@ -209,6 +367,21 @@ fn status_text(status: &Status, body_count: usize) -> Vec<String> {
         format!("Objects: {body_count}"),
         format!("Method: {method}"),
         physics,
+        format!(
+            "Labels (L): {}, traces (P): {}, orbits (E): {}, scale (S): {}",
+            on_off(options.labels),
+            match options.traces {
+                TraceMode::Absolute => "absolute",
+                TraceMode::Relative => "relative",
+                TraceMode::Off => "off",
+            },
+            on_off(options.orbits),
+            if options.true_scale {
+                "true"
+            } else {
+                "magnified"
+            }
+        ),
         format!("Threads: {}", status.threads),
         format!("Speed: {:.0} n/s", status.steps_per_second),
     ]
@@ -233,7 +406,8 @@ fn description_text(bodies: &Bodies, i: usize) -> Vec<String> {
     let position = bodies.position[i];
 
     // Values relative to the body it orbits, if any
-    let [relative_speed, relative_acceleration, relative_energy] = match bodies.orbital_parent(i) {
+    let [relative_speed, relative_acceleration, relative_energy] = match bodies.orbital_parents()[i]
+    {
         Some(p) => {
             let parent = &bodies.info[p].name;
             let relative_velocity = velocity - bodies.velocity[p];

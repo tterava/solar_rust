@@ -8,7 +8,7 @@ use std::fmt;
 
 use glam::{DMat3, DVec3};
 
-use crate::astronomy::{Bodies, NewBody, Oblateness};
+use crate::astronomy::{Bodies, Emission, NewBody, Oblateness};
 use crate::forces::G;
 
 /// The date the simulation starts from
@@ -60,9 +60,9 @@ const fn body(
 #[rustfmt::skip]
 pub const KNOWN_BODIES: &[KnownBody] = &[
     body("Sun", "10", 132712440041.93938, 695700.0, [255, 255, 0], 100.0),
-    body("Mercury", "199", 22031.86855, 2439.4, [255, 0, 0], 2.0E7),
-    body("Venus", "299", 324858.592, 6051.84, [0, 255, 0], 2.0E7),
-    body("Earth", "399", 398600.435436, 6371.01, [0, 0, 255], 1.0E7),
+    body("Mercury", "199", 22031.86855, 2439.4, [160, 150, 140], 2.0E7),
+    body("Venus", "299", 324858.592, 6051.84, [230, 205, 150], 2.0E7),
+    body("Earth", "399", 398600.435436, 6371.01, [90, 140, 230], 1.0E7),
     body("Moon", "301", 4902.800066, 1737.4, [255, 255, 255], 1.0E7),
     body("Mars", "499", 42828.375662, 3389.92, [255, 50, 0], 2.0E7),
     body("Phobos", "401", 7.208E-4, 11.1, [200, 200, 200], 2.0E11), // From mass 1.08E16 kg
@@ -222,6 +222,16 @@ const OBLATENESS: &[(&str, f64, [f64; 3], f64, f64)] = &[
     ("Neptune", 25225.0, [3408.4E-6, -33.4E-6, 0.0], 299.50, 42.96),
 ];
 
+/// Light given off, where it's known better than the mass and radius imply: the IAU 2015 nominal
+/// solar luminosity and effective temperature (resolution B3)
+const EMISSION: &[(&str, Emission)] = &[(
+    "Sun",
+    Emission {
+        luminosity: Some(3.828E26),
+        temperature: Some(5772.0),
+    },
+)];
+
 /// Obliquity of the ecliptic at J2000 (IAU 1976), the angle between the ICRF equator and
 /// the ecliptic. Horizons uses this value for its ecliptic frame.
 const OBLIQUITY_DEGREES: f64 = 84381.448 / 3600.0;
@@ -299,6 +309,10 @@ pub fn solar_system() -> Bodies {
             oblateness: oblateness(known.name),
             magnification: known.magnification,
             color: known.color,
+            emission: EMISSION
+                .iter()
+                .find(|(name, _)| *name == known.name)
+                .map_or_else(Emission::default, |&(_, emission)| emission),
         });
     }
 

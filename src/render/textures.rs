@@ -4,11 +4,26 @@
 //!
 //! The files are written by `cargo run --example fetch_textures`: equirectangular maps named
 //! after the body (`earth.jpg`, `52_europa.jpg`), with east to the right, the north pole at the
-//! top and 0° longitude in the middle.
+//! top and 0° longitude in the middle, and ring strips (`saturn_ring.png`) running from the inner
+//! edge to the outer edge, with the rings' opacity in alpha.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
+
+/// Textures being loaded or waiting to be uploaded
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether all textures are loaded and uploaded
+pub fn all_loaded() -> bool {
+    PENDING.load(Ordering::Relaxed) == 0
+}
+
+/// Called once a loaded texture is uploaded
+pub fn uploaded() {
+    PENDING.fetch_sub(1, Ordering::Relaxed);
+}
 
 /// One level of a texture: RGBA, 8 bits per channel, sRGB encoded
 pub struct Image {
@@ -17,9 +32,18 @@ pub struct Image {
     pub pixels: Vec<u8>,
 }
 
-/// A body's texture with all its mip levels, largest first
+/// What a texture is for
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Surface {
+    /// A body's map
+    Body(Arc<str>),
+    /// A body's rings
+    Rings(Arc<str>),
+}
+
+/// A texture with all its mip levels, largest first
 pub struct Loaded {
-    pub body: Arc<str>,
+    pub surface: Surface,
     pub mips: Vec<Image>,
 }
 
@@ -52,19 +76,31 @@ pub fn file_name(body: &str) -> String {
     format!("{stem}.jpg")
 }
 
+/// The ring texture file for a body, like `saturn_ring.png`
+pub fn ring_file_name(body: &str) -> String {
+    file_name(body).replace(".jpg", "_ring.png")
+}
+
 /// Starts loading the textures of `bodies` that have a file, in order. They arrive on the returned
 /// channel as they're ready.
 pub fn spawn_loader(bodies: Vec<Arc<str>>) -> Receiver<Loaded> {
     let directory = directory();
-    let queue: Vec<(Arc<str>, PathBuf)> = bodies
+    let queue: Vec<(Surface, PathBuf)> = bodies
         .into_iter()
-        .map(|body| {
-            let path = directory.join(file_name(&body));
-            (body, path)
+        .flat_map(|body| {
+            [
+                (
+                    directory.join(file_name(&body)),
+                    Surface::Body(body.clone()),
+                ),
+                (directory.join(ring_file_name(&body)), Surface::Rings(body)),
+            ]
         })
-        .filter(|(_, path)| path.exists())
+        .filter(|(path, _)| path.exists())
+        .map(|(path, surface)| (surface, path))
         .rev()
         .collect();
+    PENDING.store(queue.len(), Ordering::Relaxed);
     let queue = Arc::new(Mutex::new(queue));
     let (sender, receiver) = mpsc::channel();
 
@@ -73,16 +109,19 @@ pub fn spawn_loader(bodies: Vec<Arc<str>>) -> Receiver<Loaded> {
     for _ in 0..(cores / 2).clamp(1, 4) {
         let (queue, sender) = (queue.clone(), sender.clone());
         std::thread::spawn(move || loop {
-            let Some((body, path)) = queue.lock().unwrap().pop() else {
+            let Some((surface, path)) = queue.lock().unwrap().pop() else {
                 return;
             };
             match load(&path) {
                 Ok(mips) => {
-                    if sender.send(Loaded { body, mips }).is_err() {
+                    if sender.send(Loaded { surface, mips }).is_err() {
                         return;
                     }
                 }
-                Err(error) => eprintln!("Failed to load {}: {error}", path.display()),
+                Err(error) => {
+                    eprintln!("Failed to load {}: {error}", path.display());
+                    PENDING.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         });
     }
@@ -165,6 +204,7 @@ mod tests {
         assert_eq!(file_name("Earth"), "earth.jpg");
         assert_eq!(file_name("52 Europa"), "52_europa.jpg");
         assert_eq!(file_name("Psyche (spacecraft)"), "psyche__spacecraft_.jpg");
+        assert_eq!(ring_file_name("Saturn"), "saturn_ring.png");
     }
 
     #[test]
